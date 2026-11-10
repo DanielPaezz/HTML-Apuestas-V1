@@ -17,11 +17,30 @@ JUEGOS_MIN_SEMANA = 2  # NFL: si a la semana actual le quedan <= N juegos, se mu
 N_PROX = 10           # Fútbol: los N partidos más cercanos por competición (sin importar la fecha)
 ESPN_DIAS = 60        # Fútbol: hasta cuántos días hacia adelante buscar en ESPN
 DIAS_RES = 7          # Resultados: partidos terminados en los últimos N días
-N_RACHA = 5           # Racha: últimos N partidos de cada equipo
+N_FORMA = 5           # Racha y estrellas ofensiva/defensiva: últimos N juegos
 MODELO_IA = "gemini-2.5-flash"
 SALIDA = "index.html"
 TS = pd.Timestamp
 DIAG = []             # mensajes de diagnóstico (se imprimen y se muestran en el HTML si una pestaña sale vacía)
+
+# ── Lesiones ──
+LES_MAX_DIAS = 9          # ESPN: un reporte que no sea de largo plazo (IR/PUP/susp.) con más de N días se ignora
+FORZAR_ACTIVO = set()     # nombres que SIEMPRE se tratan como sanos (parche manual). Vacío = no se fuerza a nadie.
+
+# ── Modelo de QB (valor del QB titular vs. su suplente) ──
+# Modo QB_OUT_ONLY: solo se aplica la penalización si el reporte lo marca Out/Inactive.
+# Si el QB está activo, Questionable/Doubtful o no aparece, se usa el Ridge sin ajuste.
+# Si ya calibraste con calibrar_qb.py, pega aquí los valores que te recomendó.
+QB_DB_JUEGO = 36.0        # dropbacks (pases + sacks) por partido
+QB_PRIOR_DB = 150.0       # fuerza del "jalón" hacia el promedio (más alto = más conservador)
+QB_HL = 150               # vida media (días) del peso de cada partido, igual que el Ridge
+QB_ESCALA = 1.0           # perilla global: 0.8 = penalizaciones 20 % más chicas
+QB_MAX_PTS = 10.0         # tope de puntos que vale un QB sobre su suplente
+QB_BONO_MAX = 2.0         # tope del ajuste positivo cuando el titular SÍ juega
+QB_CORREGIR_JUEGA = False # modo QB_OUT_ONLY: si el titular está activo, se conserva el Ridge normal
+QB_PEN_DEF = 3.5          # penalización fija si no hay datos de EPA
+QB_YDS_K = 0.8            # cuánto se mueven las yardas aéreas del equipo por cada punto de ajuste de QB
+PTS_EQUIPO = 22.0         # puntos promedio por equipo (para escalar yardas)
 
 
 def diag(msg):
@@ -37,27 +56,12 @@ def num(x):
         return None
 
 
-def fila(l, m, d, sd=None, line=None, o="Over", u="Under", p=None, real=None, dec=2):
-    """dec=0 -> yardas y similares: proyección y real redondeados a entero."""
-    m = round(float(m), dec) if dec else int(round(float(m)))
-    if dec == 0 and real is not None:
-        real = int(round(real))
-    return dict(l=l, m=m, d=d, sd=sd, line=line, o=o, u=u, p=p, real=real)
+def fila(l, m, d, sd=None, line=None, o="Over", u="Under", p=None, real=None):
+    return dict(l=l, m=round(float(m), 2), d=d, sd=sd, line=line, o=o, u=u, p=p, real=real)
 
 
 def norm_cdf(z):
     return 0.5 * (1 + math.erf(z / math.sqrt(2)))
-
-
-def racha(df, t, ch, ca, sh, sa, ref, n=N_RACHA):
-    """Últimos n resultados del equipo t antes de ref: 'G' ganó, 'E' empató, 'P' perdió (del más viejo al más reciente)."""
-    d = df[((df[ch] == t) | (df[ca] == t)) & (df.Date < ref)].sort_values("Date").tail(n)
-    out = []
-    for r in d.itertuples():
-        gh, ga = getattr(r, sh), getattr(r, sa)
-        gf, gc = (gh, ga) if getattr(r, ch) == t else (ga, gh)
-        out.append("G" if gf > gc else ("E" if gf == gc else "P"))
-    return out
 
 
 def ml_dec(x):
@@ -66,6 +70,55 @@ def ml_dec(x):
     if x is None or x == 0:
         return None
     return round(1 + x / 100, 3) if x > 0 else round(1 + 100 / abs(x), 3)
+
+
+# ───────────────────────── Racha y estrellas (últimos N juegos) ─────────────────────────
+def racha_equipo(gl, t, ref, n=N_FORMA):
+    """Resultado de los últimos n juegos del equipo, del más viejo al más reciente: G (ganó), E (empató), P (perdió).
+    gl: DataFrame con Date, h, a, gh, ga."""
+    g = gl[(gl.Date < ref) & ((gl.h == t) | (gl.a == t))].sort_values("Date").tail(n)
+    out = ""
+    for r in g.itertuples():
+        mio, rival = (r.gh, r.ga) if r.h == t else (r.ga, r.gh)
+        out += "G" if mio > rival else ("P" if mio < rival else "E")
+    return out
+
+
+def estrellas_liga(gl, ref, n=N_FORMA, minj=1):
+    """Estrellas 1-5 de ofensiva y defensiva (5 = mejor) con los últimos n juegos de CADA equipo de la liga.
+    1) Cada juego se ajusta por el rival: los puntos/goles a favor se descuentan si el rival suele conceder mucho,
+       y los concedidos se descuentan si el rival suele anotar mucho (promedios de todos los equipos antes de ref).
+    2) Se promedian los últimos n juegos ajustados de cada equipo.
+    3) Se ordenan TODOS los equipos y se reparten en quintiles: el 20 % mejor = 5 estrellas ... el 20 % peor = 1.
+    Devuelve {equipo: dict(of, de, gf, gc, n)} con gf/gc sin ajustar (para mostrar)."""
+    gl = gl[gl.Date < ref]
+    if gl.empty:
+        return {}
+    largo = pd.concat([
+        pd.DataFrame(dict(t=gl.h, opp=gl.a, Date=gl.Date, gf=gl.gh, gc=gl.ga)),
+        pd.DataFrame(dict(t=gl.a, opp=gl.h, Date=gl.Date, gf=gl.ga, gc=gl.gh))]).sort_values("Date")
+    prom = largo.groupby("t")[["gf", "gc"]].mean()          # lo que cada equipo suele anotar / conceder
+    liga = float(largo.gf.mean())                           # promedio de la liga
+    largo["gfa"] = largo.gf - (largo.opp.map(prom.gc) - liga).fillna(0)
+    largo["gca"] = largo.gc - (largo.opp.map(prom.gf) - liga).fillna(0)
+    res = {}
+    for t, g in largo.groupby("t"):
+        u = g.tail(n)
+        if len(u) >= minj:
+            res[t] = dict(gf=float(u.gf.mean()), gc=float(u.gc.mean()),
+                          gfa=float(u.gfa.mean()), gca=float(u.gca.mean()), n=int(len(u)))
+    if len(res) < 4:
+        return {}
+
+    def rank(key, clave, mayor_mejor):
+        orden = sorted(res, key=lambda t: res[t][key], reverse=mayor_mejor)
+        N = len(orden)
+        for i, t in enumerate(orden):
+            res[t][clave] = 5 - min(4, int(i / N * 5))
+
+    rank("gfa", "of", True)
+    rank("gca", "de", False)
+    return res
 
 
 # ───────────────────────── Secretos / IA ─────────────────────────
@@ -92,12 +145,14 @@ def ia(fx, dep):
                '"picks":[{"id":"..","mercado":"..","eleccion":"..","cuota":2.1,"confianza":"alta|media|baja","razon":".."}]}')
         prompt = (f"Hoy es {HOY}. Eres analista de apuestas deportivas de {dep}. Te paso el modelo estadístico propio "
                   "de los próximos partidos: proyección, probabilidades del resultado con su cuota (decimal), y para cada "
-                  "mercado la media del modelo y la línea de referencia.\n"
+                  "mercado la media del modelo y la línea de referencia. El campo 'qb_ajuste' (si existe) indica si el QB "
+                  "titular está fuera o dudoso y cuántos puntos ya restó el modelo.\n"
                   f"{json.dumps(fx, ensure_ascii=False)}\n"
                   "Busca en la web lesiones, alineaciones probables, clima y noticias recientes de esos partidos y "
                   "combínalo con el modelo. Devuelve SOLO un objeto JSON (sin markdown) con esta forma: " + esq + ". "
                   "Reglas: máximo 6 picks; solo si hay valor real (prob. del modelo × cuota > 1, o media del modelo "
                   "claramente por encima/debajo de la línea) y las noticias no lo contradicen; si no hay valor, picks vacío. "
+                  "Nunca propongas un pick sobre un jugador lesionado, dudoso o que no sea titular (revisa 'bajas'). "
                   "'eleccion' debe ser concreta (ej. 'Over 2.5 goles', 'Bills -3.5', 'Gana Real Madrid'). "
                   "'razon' máximo 25 palabras citando modelo y noticia. No inventes cuotas: usa las dadas o null.")
         r = genai.Client(api_key=k).models.generate_content(
@@ -155,12 +210,115 @@ DIVS = {"AFC Este": "BUF MIA NE NYJ", "AFC Norte": "BAL CIN CLE PIT", "AFC Sur":
         "NFC Sur": "ATL CAR NO TB", "NFC Oeste": "ARI LA SF SEA"}
 DIV = {t: d for d, ts in DIVS.items() for t in ts.split()}
 
+# Apodo (última palabra del nombre en ESPN) -> abreviatura de nflverse
+NFL_NICK = {"Cardinals": "ARI", "Falcons": "ATL", "Ravens": "BAL", "Bills": "BUF", "Panthers": "CAR", "Bears": "CHI",
+            "Bengals": "CIN", "Browns": "CLE", "Cowboys": "DAL", "Broncos": "DEN", "Lions": "DET", "Packers": "GB",
+            "Texans": "HOU", "Colts": "IND", "Jaguars": "JAX", "Chiefs": "KC", "Raiders": "LV", "Chargers": "LAC",
+            "Rams": "LA", "Dolphins": "MIA", "Vikings": "MIN", "Patriots": "NE", "Saints": "NO", "Giants": "NYG",
+            "Jets": "NYJ", "Eagles": "PHI", "Steelers": "PIT", "49ers": "SF", "Seahawks": "SEA", "Buccaneers": "TB",
+            "Titans": "TEN", "Commanders": "WAS"}
+
 
 def es_div(r, h, a):
     v = getattr(r, "div_game", None)          # columna de nflverse; si no existe, se usa el diccionario
     if v is not None and v == v:
         return bool(int(v))
     return DIV.get(h) is not None and DIV.get(h) == DIV.get(a)
+
+
+def _nj(s):
+    """Nombre de jugador normalizado y sin sufijos (Jr., II...), para cruzar ESPN con nflverse."""
+    t = _n(s).split()
+    while len(t) > 1 and t[-1] in ("jr", "sr", "ii", "iii", "iv", "v"):
+        t.pop()
+    return " ".join(t)
+
+
+SANO = ("", "probable", "nan", "none", "active", "activo")
+LARGA = ("reserve", "pup", "suspen", "nfi", "non-football", "physically unable")
+
+
+def _ts(x):
+    """Cualquier fecha -> Timestamp sin zona horaria (o None)."""
+    try:
+        t = pd.to_datetime(x, utc=True, errors="coerce")
+        return None if pd.isna(t) else t.tz_convert(None)
+    except Exception:
+        return None
+
+
+def lesionados(nfr, temp, semanas):
+    """{semana: {equipo: {nombre_normalizado: dict(n, pos, est, src)}}}.
+    Fuentes: ESPN (reporte vigente) + nflverse (reporte de CADA semana). Entre las dos gana la más reciente.
+    Un reporte de ESPN que no sea de largo plazo (IR/PUP/susp.) y tenga más de LES_MAX_DIAS se descarta.
+    Cualquier estado distinto de 'Probable' (Out, Doubtful, Questionable, Day-To-Day, IR...) cuenta como lesión."""
+    ahora = pd.Timestamp.now(tz="UTC").tz_convert(None)
+    forzar = {_nj(x) for x in FORZAR_ACTIVO}
+    viejos, espn_c = [], {}
+
+    def add(d, t, nombre, pos, est, f, src):
+        if not t or not nombre:
+            return
+        d.setdefault((t, _nj(nombre)), []).append(
+            dict(n=str(nombre), pos=str(pos or ""), est=str(est or "").strip(), f=f, src=src))
+
+    try:
+        r = requests.get("https://site.api.espn.com/apis/site/v2/sports/football/nfl/injuries", timeout=30)
+        r.raise_for_status()
+        for eq in r.json().get("injuries", []):
+            t = NFL_NICK.get(str(eq.get("displayName", "")).split(" ")[-1])
+            for x in eq.get("injuries", []):
+                a = x.get("athlete") or {}
+                est = str(x.get("status") or "").strip()
+                f = _ts(x.get("date"))
+                if f is not None and not any(k in est.lower() for k in LARGA) and (ahora - f).days > LES_MAX_DIAS:
+                    viejos.append(f"{a.get('displayName')} ({est}, {f:%d-%b})")
+                    continue
+                add(espn_c, t, a.get("displayName"), (a.get("position") or {}).get("abbreviation"), est, f, "ESPN")
+    except Exception as e:
+        diag(f"NFL lesiones: ESPN falló ({e})")
+    if viejos:
+        diag(f"NFL lesiones: ESPN con reporte viejo ignorado: {viejos[:8]}")
+
+    try:
+        nv = nfr.load_injuries(temp).to_pandas()
+    except Exception as e:
+        nv = None
+        diag(f"NFL lesiones: nflverse no disponible ({e})")
+
+    out = {}
+    for s in sorted(set(semanas)):
+        c = {k: list(v) for k, v in espn_c.items()}
+        if nv is not None:
+            for r in nv[nv.week == s].itertuples():
+                add(c, NFL_TEAM.get(r.team, r.team), r.full_name, r.position, r.report_status,
+                    _ts(getattr(r, "date_modified", None)), "nflverse")
+        inj = {}
+        for (t, nn), lst in c.items():
+            lst.sort(key=lambda z: (z["f"] or pd.Timestamp.min, z["src"] == "nflverse"))
+            z = lst[-1]                                   # el reporte más reciente manda
+            if z["est"].lower() in SANO or nn in forzar:
+                continue
+            inj.setdefault(t, {})[nn] = dict(n=z["n"], pos=z["pos"], est=z["est"], src=z["src"])
+        out[s] = inj
+        diag(f"NFL lesiones semana {s}: {sum(len(v) for v in inj.values())} jugadores en {len(inj)} equipos")
+    return out
+
+
+def es_fuera(est):
+    """True solo para estados que confirman que el jugador no estará disponible.
+    Questionable/Doubtful/Day-To-Day NO activan el ajuste; se conserva el Ridge normal."""
+    e = str(est or "").strip().lower()
+    return e in ("out", "inactive", "inactivo", "not active", "not playing") or any(
+        k in e for k in ("reserve", "pup", "suspen", "nfi", "non-football", "physically unable")
+    )
+
+
+def partir_lesiones(inj):
+    """bad: quienes NO jugarán. duda: quienes están dudosos (Questionable, Doubtful, Day-To-Day)."""
+    bad = {t: frozenset(n for n, x in v.items() if es_fuera(x["est"])) for t, v in inj.items()}
+    duda = {t: {n: x["est"] for n, x in v.items() if not es_fuera(x["est"])} for t, v in inj.items()}
+    return bad, duda
 
 
 def stats_nfl(nfr, seasons, sch):
@@ -237,47 +395,231 @@ def pred_nfl(M, h, a):
     return mar, tot
 
 
-def jugador(M, team, pos, ref, dfn_opp):
-    ycol, vcol, _ = POS[pos]
+def ranking(M, team, pos, ref, activo=True):
+    """Jugadores del equipo en la posición, de mayor a menor volumen reciente (intentos / acarreos / targets).
+    activo=True: solo quienes jugaron en el ÚLTIMO partido del equipo (proxy de titular sano y vigente)."""
+    vcol = POS[pos][1]
     d = M["ps"]
+    de = d[d.team == team]
+    if de.empty:
+        return []
+    ult = de.Date.max()
     d = d[d.position == pos]
     rec = d[(d.team == team) & (d.Date >= ref - dt.timedelta(days=42))]
     if rec.empty:
         rec = d[d.team == team]
     if rec.empty:
-        return None
-    g = rec.groupby(["player_id", "player_display_name"])[vcol].sum()
-    if g.empty or g.max() <= 0:
-        return None
-    pid, nombre = g.idxmax()
-    h = d[d.player_id == pid].sort_values("Date", ascending=False).head(8)
-    n = len(h)
-    w = 0.7 ** np.arange(n)
-    mu = float(np.average(h[ycol], weights=w)) * dfn_opp
-    var_j = float(h[ycol].var(ddof=0)) if n > 1 else 0.0
-    sd = math.sqrt((n * var_j + 4 * M["sd_pos"][pos] ** 2) / (n + 4))
-    return pid, nombre, mu, max(sd, 10.0)
+        return []
+    g = rec.groupby(["player_id", "player_display_name"])[vcol].sum().sort_values(ascending=False)
+    g = g[g > 0]
+    if activo:
+        jugo = set(d.loc[(d.team == team) & (d.Date == ult), "player_id"])
+        g = g[[pid in jugo for pid, _ in g.index]]
+    return list(g.index)
 
 
-def filas_nfl(h, a, mar, tot, sp_line, tot_line, M, ref, R=None):
+def jugador(M, team, pos, ref, dfn_opp, bad=frozenset(), activo=True):
+    """Titular de la posición que se usará para la apuesta: el de más volumen que jugó el último partido
+    y que NO figura en el reporte de lesiones (bad = nombres normalizados no disponibles)."""
+    ycol = POS[pos][0]
+    d = M["ps"]
+    d = d[d.position == pos]
+    for pid, nombre in ranking(M, team, pos, ref, activo=activo):
+        if _nj(nombre) in bad:
+            continue
+        h = d[d.player_id == pid].sort_values("Date", ascending=False).head(8)
+        n = len(h)
+        w = 0.7 ** np.arange(n)
+        mu = float(np.average(h[ycol], weights=w)) * dfn_opp
+        var_j = float(h[ycol].var(ddof=0)) if n > 1 else 0.0
+        sd = math.sqrt((n * var_j + 4 * M["sd_pos"][pos] ** 2) / (n + 4))
+        return pid, nombre, mu, max(sd, 10.0)
+    return None
+
+
+def bajas_clave(M, team, ref, inj):
+    """Jugadores principales (QB1, RB1, WR1 y WR2 por volumen reciente) que están en el reporte de lesiones."""
+    if "ps" not in M:
+        return []
+    rep = inj.get(team, {})
+    out = []
+    for pos, k in (("QB", 1), ("RB", 1), ("WR", 2)):
+        for pid, nombre in ranking(M, team, pos, ref, activo=False)[:k]:
+            x = rep.get(_nj(nombre))
+            if x:
+                out.append(dict(n=nombre, pos=pos, est=x["est"]))
+    return out
+
+
+# ───────────────────────── Modelo de QB ─────────────────────────
+def qb_modelo(ps, ref):
+    """{equipo: dict(n, s, delta, bk, q_s, q_b)} — valor del QB titular vs. su suplente, en puntos por partido.
+    1) EPA por dropback (pases + sacks) ponderado por recencia.
+    2) Encogimiento: titulares hacia el promedio de titulares, suplentes hacia el nivel de reemplazo.
+    3) delta = (EPA titular - EPA suplente) x dropbacks por juego, acotado a 0.5-QB_MAX_PTS.
+    s = % de las jugadas recientes del equipo que tomó el titular (el Ridge ya trae esa mezcla)."""
+    try:
+        if ps is None or "passing_epa" not in ps.columns:
+            diag(f"QB: no hay passing_epa en las stats; se usa penalización fija de {QB_PEN_DEF} pts")
+            return {}
+        d = ps[(ps.position == "QB") & (ps.Date < ref)].copy()
+        sk = next((c for c in ("sacks_suffered", "sacks") if c in d.columns), None)
+        d["db"] = d.attempts + (pd.to_numeric(d[sk], errors="coerce").fillna(0) if sk else 0)
+        d["epa"] = pd.to_numeric(d.passing_epa, errors="coerce").fillna(0)
+        d = d[(d.db >= 5)].dropna(subset=["Date"])            # fuera pases de trucos / entradas de 1-2 jugadas
+        if len(d) < 40:
+            return {}
+        d["w"] = 0.5 ** ((ref - d.Date).dt.days / QB_HL)
+        d["wdb"], d["wepa"] = d.w * d.db, d.w * d.epa
+
+        por = d.groupby(["team", "player_id"])[["wdb", "wepa"]].sum().reset_index()
+        top = por.loc[por.groupby("team").wdb.idxmax()]
+        es_st = por.player_id.isin(set(top.player_id))
+        mu_st = por[es_st].wepa.sum() / max(por[es_st].wdb.sum(), 1e-9)          # EPA/jugada típico de un titular
+        bk_ = por[~es_st]
+        mu_rep = bk_.wepa.sum() / bk_.wdb.sum() if bk_.wdb.sum() > 0 else mu_st - 0.15   # nivel de reemplazo
+
+        pj = d.groupby("player_id")[["wdb", "wepa"]].sum()
+
+        def rating(pid, mu):
+            x = pj.loc[pid]
+            return float((x.wepa + QB_PRIOR_DB * mu) / (x.wdb + QB_PRIOR_DB))
+
+        Q = {}
+        for t, g in d.groupby("team"):
+            rec = g[g.Date >= ref - dt.timedelta(days=42)]
+            base = rec if len(rec) else g
+            pid = base.groupby("player_id").db.sum().sort_values(ascending=False).index[0]
+            tot = g.wdb.sum()
+            s = float(g.loc[g.player_id == pid, "wdb"].sum() / tot) if tot > 0 else 1.0
+            nombre = g.loc[g.player_id == pid, "player_display_name"].iloc[0]
+            q_s = rating(pid, mu_st)
+            # Ordena los posibles reemplazos por uso RECIENTE, no por volumen histórico.
+            # Así un QB veterano que apenas jugó una jugada no desplaza al QB3 que acaba de entrar.
+            rec_g = g[g.Date >= ref - dt.timedelta(days=42)]
+            base_rep = rec_g if len(rec_g) else g
+            usos = base_rep.groupby("player_id").db.sum().sort_values(ascending=False)
+            q_alts = []
+            for bid in usos.index:
+                if bid == pid:
+                    continue
+                bg = g[g.player_id == bid]
+                if bg.empty:
+                    continue
+                q_alts.append(dict(pid=str(bid), n=bg.player_display_name.iloc[0],
+                                   q=float(rating(bid, mu_rep)), uso=float(usos.loc[bid])))
+            if q_alts:
+                q_b, bn = q_alts[0]["q"], q_alts[0]["n"]
+            else:
+                q_b, bn = mu_rep, "suplente no identificado"
+            delta = float(np.clip((q_s - q_b) * QB_DB_JUEGO * QB_ESCALA, 0.5, QB_MAX_PTS))
+            Q[t] = dict(n=nombre, s=min(1.0, s), delta=delta, bk=bn, q_s=q_s, q_b=q_b,
+                        q_alts=q_alts)
+        return Q
+    except Exception as e:
+        diag(f"QB: modelo falló ({type(e).__name__}: {e})")
+        return {}
+
+
+def escenario_qb(Q, team, inj, M, ref):
+    """Estado del QB titular y su ajuste en PUNTOS del equipo en cada escenario.
+    estado: ok (sano) | duda (Questionable/Doubtful/Day-To-Day) | fuera (Out/IR/...).
+    juega / fuera: puntos que se suman (+) o restan (-) al equipo en cada caso."""
+    q = Q.get(team)
+    if not q and "ps" in M:                                   # respaldo: sin EPA, penalización fija
+        rk = ranking(M, team, "QB", ref, activo=False)
+        if rk:
+            q = dict(n=rk[0][1], s=1.0, delta=QB_PEN_DEF, bk="suplente")
+    if not q:
+        return None
+    rep = inj.get(team, {})
+    x = rep.get(_nj(q["n"]))
+    est = x["est"] if x else ""
+    estado = "ok" if not x else ("fuera" if es_fuera(est) else "duda")
+
+    # Si el QB identificado está fuera, busca al siguiente QB con uso reciente
+    # que NO esté marcado OUT/IR. No usa automáticamente el suplente histórico.
+    bk = q.get("bk", "suplente no identificado")
+    q_s = float(q.get("q_s", 0.0))
+    q_b = float(q.get("q_b", 0.0))
+    if estado == "fuera":
+        candidatos = q.get("q_alts", [])
+        elegido = next((z for z in candidatos
+                        if not es_fuera(rep.get(_nj(z["n"]), {}).get("est", ""))), None)
+        if elegido:
+            bk = elegido["n"]
+            q_b = float(elegido["q"])
+        else:
+            bk = "QB disponible no identificado"
+        # Recalcula la diferencia con el reemplazo elegido.
+        dl = float(np.clip((q_s - q_b) * QB_DB_JUEGO * QB_ESCALA, 0.5, QB_MAX_PTS))
+    else:
+        dl = float(q["delta"])
+
+    s = float(q["s"])
+    juega = min(QB_BONO_MAX, (1 - s) * dl) if QB_CORREGIR_JUEGA else 0.0
+    return dict(n=q["n"], bk=bk, est=est, delta=round(float(dl), 1), s=round(float(s), 2),
+                estado=estado, juega=round(float(juega), 2), fuera=round(float(-s * dl), 2))
+
+
+def ajuste_base(s):
+    """Modo QB_OUT_ONLY: solo ajusta cuando el reporte confirma que el QB está fuera/inactivo; el reemplazo se selecciona entre los QB recientes disponibles.
+    Si está activo, dudoso o no aparece en el reporte, deja intacta la proyección Ridge."""
+    return 0.0 if not s or s["estado"] != "fuera" else float(s["fuera"])
+
+
+def aplicar_qb(mar, tot, adj_h, adj_a):
+    ph, pa = (tot + mar) / 2 + adj_h, (tot - mar) / 2 + adj_a
+    return ph - pa, ph + pa
+
+
+def alternativas_qb(h, a, sh, sa, mar0, tot0, spread_line, total_line):
+    """Un escenario 'si no juega' por cada QB DUDOSO. Va al final de la tarjeta."""
+    alt = []
+    for eq, s, lado in ((h, sh, "h"), (a, sa, "a")):
+        if not s or s["estado"] != "duda":
+            continue
+        ah = s["fuera"] if lado == "h" else ajuste_base(sh)
+        aa = s["fuera"] if lado == "a" else ajuste_base(sa)
+        m2, t2 = aplicar_qb(mar0, tot0, ah, aa)
+        ape = s["n"].split()[-1]
+        alt.append(dict(qb=s["n"], eq=eq, est=s["est"], pen=s["fuera"], bk=s["bk"],
+                        proy=[round((t2 + m2) / 2, 1), round((t2 - m2) / 2, 1)],
+                        p_h=float(norm_cdf(m2 / SD_MARGEN)),
+                        rows=[fila(f"Sin {ape} · Spread · local gana por >", m2, "n", SD_MARGEN, num(spread_line),
+                                   f"{h} cubre", f"{a} cubre"),
+                              fila(f"Sin {ape} · Total de puntos", t2, "n", 13, num(total_line))]))
+    return alt
+
+
+def filas_nfl(h, a, mar, tot, sp_line, tot_line, M, ref, R=None, bad=None, duda=None, adj=(0.0, 0.0)):
+    """bad: {equipo: nombres que NO jugarán (se excluyen)}. duda: {equipo: {nombre: estatus}} dudables: la fila de quien
+    SÍ juega va arriba (etiqueta DUDA) y la de su suplente (si no juega) va hasta abajo.
+    adj: ajuste de puntos por QB (local, visita) que también mueve las yardas aéreas del equipo."""
     R = R or {}
-    Y = lambda *a_, **k: fila(*a_, dec=0, **k)       # yardas: sin decimales
+    bad = bad or {}
+    duda = duda or {}
     rows = [
         fila("Spread · local gana por >", mar, "n", SD_MARGEN, num(sp_line), f"{h} cubre", f"{a} cubre", real=R.get("spread")),
         fila("Total de puntos", tot, "n", 13, num(tot_line), real=R.get("total")),
     ]
+    dudosos = []
     if M.get("air"):
         eah, eaa = esperado(M["air"], h, a)
+        eah *= 1 + QB_YDS_K * adj[0] / PTS_EQUIPO
+        eaa *= 1 + QB_YDS_K * adj[1] / PTS_EQUIPO
         egh, ega = esperado(M["gr"], h, a)
         rows += [
-            Y(f"Yds aire {h}", eah, "n", M["sd_air"], real=R.get("air_h")),
-            Y(f"Yds aire {a}", eaa, "n", M["sd_air"], real=R.get("air_a")),
-            Y(f"Yds suelo {h}", egh, "n", M["sd_gr"], real=R.get("gr_h")),
-            Y(f"Yds suelo {a}", ega, "n", M["sd_gr"], real=R.get("gr_a")),
+            fila(f"Yds aire {h}", eah, "n", M["sd_air"], real=R.get("air_h")),
+            fila(f"Yds aire {a}", eaa, "n", M["sd_air"], real=R.get("air_a")),
+            fila(f"Yds suelo {h}", egh, "n", M["sd_gr"], real=R.get("gr_h")),
+            fila(f"Yds suelo {a}", ega, "n", M["sd_gr"], real=R.get("gr_a")),
         ]
         for team, opp in ((h, a), (a, h)):
             for pos, etq, key in (("QB", "yds pase", "air"), ("RB", "yds suelo", "gr"), ("WR", "yds recep.", "air")):
-                j = jugador(M, team, pos, ref, M[key][1].get(opp, 1))
+                dfn = M[key][1].get(opp, 1)
+                fuera = bad.get(team, frozenset())
+                j = jugador(M, team, pos, ref, dfn, fuera)
                 if not j:
                     continue
                 pid, nombre, mu, sd = j
@@ -286,7 +628,21 @@ def filas_nfl(h, a, mar, tot, sp_line, tot_line, M, ref, R=None):
                     sub = R["ps_game"]
                     v = sub.loc[sub.player_id == pid, POS[pos][0]]
                     real = float(v.iloc[0]) if len(v) else None
-                rows.append(Y(f"{pos} {nombre} ({team}) · {etq}", mu, "n", sd, real=real))
+                est = duda.get(team, {}).get(_nj(nombre))
+                if not est:
+                    rows.append(fila(f"{pos} {nombre} ({team}) · {etq}", mu, "n", sd, real=real))
+                    continue
+                # dudable: SI JUEGA va arriba con su valor normal (etiqueta DUDA)...
+                rows.append(fila(f"{pos} {nombre} ({team}) · {etq} · ⚠ DUDA", mu, "n", sd, real=real))
+                # ...y SI NO JUEGA va hasta abajo con su suplente
+                excl = fuera | frozenset(duda.get(team, {})) | {_nj(nombre)}
+                s2 = jugador(M, team, pos, ref, dfn, excl, activo=False)
+                if s2:
+                    _, n2, mu2, sd2 = s2
+                    dudosos.append(fila(f"Si no juega {nombre.split()[-1]} → {pos} {n2} ({team}) · {etq}", mu2, "n", sd2, real=None))
+        if dudosos:
+            dudosos[0]["sep"] = True      # el HTML dibuja una línea y el rótulo "Si no juega" antes de esta fila
+            rows += dudosos
     if R:
         rows = [r for r in rows if r["real"] is not None]
     return rows
@@ -301,7 +657,8 @@ def nfl():
     sch["home_team"] = sch["home_team"].replace(NFL_TEAM)
     sch["away_team"] = sch["away_team"].replace(NFL_TEAM)
     jug = sch.dropna(subset=["home_score", "away_score"])
-    jugD = jug.rename(columns={"gameday": "Date"})      # para la racha
+    gl_nfl = jug[["gameday", "home_team", "away_team", "home_score", "away_score"]] \
+        .rename(columns={"gameday": "Date", "home_team": "h", "away_team": "a", "home_score": "gh", "away_score": "ga"})
 
     try:
         ps, wide, eg_d = stats_nfl(nfr, seasons, sch)
@@ -339,21 +696,47 @@ def nfl():
     M_hoy = modelo_nfl(jug, wide, ps, ref_hoy, eq, ix)
     M_sem = modelo_nfl(jug, wide, ps, ref_sem, eq, ix)
 
+    # ── Lesiones por semana de cada juego + modelo de QB ──
+    inj_w = {}
+    if len(prox):
+        try:
+            inj_w = lesionados(nfr, temp, {int(w) for w in prox.week})
+        except Exception as e:
+            diag(f"NFL lesiones falló: {e}")
+    Q = qb_modelo(ps, ref_hoy)
+    if Q:
+        top = sorted(Q.items(), key=lambda kv: -kv[1]["delta"])[:5]
+        diag("QB · valor vs suplente (pts/juego), top 5: " + ", ".join(f"{t} {q['n']} {q['delta']:.1f}" for t, q in top))
+    forma = estrellas_liga(gl_nfl, ref_hoy)
+
     out = []
     for r in prox.itertuples():
         h, a = r.home_team, r.away_team
-        mar, tot = pred_nfl(M_hoy, h, a)
-        rows = filas_nfl(h, a, mar, tot, r.spread_line, r.total_line, M_hoy, ref_hoy)
+        inj = inj_w.get(int(r.week), {})
+        bad, duda = partir_lesiones(inj)
+
+        mar0, tot0 = pred_nfl(M_hoy, h, a)                     # modelo base (sin ajuste de QB)
+        sh = escenario_qb(Q, h, inj, M_hoy, ref_hoy)
+        sa = escenario_qb(Q, a, inj, M_hoy, ref_hoy)
+        ah, aa = ajuste_base(sh), ajuste_base(sa)
+        mar, tot = aplicar_qb(mar0, tot0, ah, aa)              # modelo normal (QB dudoso = juega)
+        alt = alternativas_qb(h, a, sh, sa, mar0, tot0, r.spread_line, r.total_line)
+        qbn = [dict(eq=eq_, n=s["n"], estado=s["estado"], est=s["est"], adj=ajuste_base(s), fuera=s["fuera"], bk=s["bk"])
+               for eq_, s in ((h, sh), (a, sa)) if s and s["estado"] != "ok"]
+
+        rows = filas_nfl(h, a, mar, tot, r.spread_line, r.total_line, M_hoy, ref_hoy, bad=bad, duda=duda, adj=(ah, aa))
         ph = norm_cdf(mar / SD_MARGEN)
         probs = [dict(l=h, p=float(ph), c=ml_dec(getattr(r, "home_moneyline", None))),
                  dict(l=a, p=float(1 - ph), c=ml_dec(getattr(r, "away_moneyline", None)))]
-        form = [racha(jugD, h, "home_team", "away_team", "home_score", "away_score", ref_hoy),
-                racha(jugD, a, "home_team", "away_team", "home_score", "away_score", ref_hoy)]
+        les = dict(h=bajas_clave(M_hoy, h, ref_hoy, inj), a=bajas_clave(M_hoy, a, ref_hoy, inj)) if inj else None
         out.append(dict(sp="NFL", lg="NFL", date=str(r.gameday.date()), home=h, away=a,
                         week=int(r.week), div=es_div(r, h, a),
                         logo_h=logo(h, "NFL"), logo_a=logo(a, "NFL"),
                         proy=[round((tot + mar) / 2, 1), round((tot - mar) / 2, 1)],
-                        rows=rows, probs=probs, form=form, ia=""))
+                        racha=dict(h=racha_equipo(gl_nfl, h, ref_hoy), a=racha_equipo(gl_nfl, a, ref_hoy)),
+                        les=les, forma=dict(h=forma.get(h), a=forma.get(a)),
+                        qb=qbn, alt=alt,
+                        rows=rows, probs=probs, ia=""))
 
     hist_res = []
     for r in ult_semana.itertuples():
@@ -546,6 +929,35 @@ def stat_espn(c, nombres):
     return None
 
 
+def odds_comp(c):
+    """Momios 1X2 (decimales) que ESPN adjunta a un partido, si la casa ya los publicó: [local, empate, visita].
+    Nunca lanza error: si el formato es raro devuelve [None]*3 (un fallo aquí no debe tirar el partido)."""
+    try:
+        odds = c.get("odds") or []
+        if isinstance(odds, dict):
+            odds = [odds]
+        for o in odds:
+            if not isinstance(o, dict):
+                continue
+            ml = o.get("moneyline") if isinstance(o.get("moneyline"), dict) else {}
+            v = []
+            for k in ("home", "draw", "away"):
+                x = ml.get(k)
+                x = x.get("close") if isinstance(x, dict) else None
+                v.append(ml_dec(x.get("odds") if isinstance(x, dict) else None))
+            if all(v):
+                return v
+            v = []
+            for k in ("homeTeamOdds", "drawOdds", "awayTeamOdds"):
+                x = o.get(k)
+                v.append(ml_dec(x.get("moneyLine") if isinstance(x, dict) else None))
+            if all(v):
+                return v
+    except Exception:
+        pass
+    return [None] * 3
+
+
 def _espn_dia(slug, d):
     url = f"https://site.api.espn.com/apis/site/v2/sports/soccer/{slug}/scoreboard"
     r = requests.get(url, params={"dates": f"{d:%Y%m%d}"}, timeout=30)
@@ -584,6 +996,7 @@ def _espn_ventana(slug, d1, d2):
                             FTHG=num(H.get("score")), FTAG=num(Av.get("score")),
                             HC=stat_espn(H, ("wonCorners",)), AC=stat_espn(Av, ("wonCorners",)),
                             HST=stat_espn(H, ("shotsOnTarget",)), AST=stat_espn(Av, ("shotsOnTarget",)),
+                            cu=odds_comp(c),
                             fin=bool(e["status"]["type"]["completed"])))
         except Exception:
             continue
@@ -605,6 +1018,34 @@ def espn(slug, d1, d2, paso=30):
     if not frames:
         return pd.DataFrame()
     return pd.concat(frames, ignore_index=True).drop_duplicates(subset=["Date", "h", "a"])
+
+
+def odds_espn(slug, nombres, dias):
+    """Respaldo de momios: los que ESPN publica en el scoreboard de los días indicados.
+    Devuelve {(local, visita): [1, X, 2]} con los nombres ya mapeados al histórico."""
+    out = {}
+    dias = sorted({d + dt.timedelta(days=k) for d in dias for k in (-1, 0)})   # ±1 día por la zona horaria
+
+    def uno(d):
+        try:
+            return _espn_dia(slug, d)
+        except Exception:
+            return []
+
+    with ThreadPoolExecutor(8) as ex:
+        eventos = [e for lst in ex.map(uno, dias) for e in lst]
+    for e in eventos:
+        try:
+            c = e["competitions"][0]
+            H = next(x for x in c["competitors"] if x["homeAway"] == "home")
+            Av = next(x for x in c["competitors"] if x["homeAway"] == "away")
+            cu = odds_comp(c)
+            if all(cu):
+                out[(mapear(H["team"]["displayName"], nombres), mapear(Av["team"]["displayName"], nombres))] = cu
+        except Exception:
+            continue
+    diag(f"{slug}: ESPN trae momios de {len(out)} partidos")
+    return out
 
 
 def espn_prox(slug, nombres=None, act=None):
@@ -629,7 +1070,7 @@ def espn_prox(slug, nombres=None, act=None):
                     if (h2, a2) in vistos:
                         continue
                     vistos.add((h2, a2))
-                    res.append(dict(h=h2, a=a2, Date=r.Date, cu=[None] * 3, src="ESPN"))
+                    res.append(dict(h=h2, a=a2, Date=r.Date, cu=list(r.cu), src="ESPN"))
         except Exception as e:
             diag(f"ESPN {slug} {d:%Y-%m-%d}→{e2:%Y-%m-%d}: {e}")
         d = e2 + dt.timedelta(days=1)
@@ -781,10 +1222,11 @@ def momios_api(sport, nombres):
     Sirve sobre todo para Champions, que no trae cuotas en ESPN."""
     k = secreto("ODDS_API_KEY")
     if not k:
+        diag(f"{sport}: The Odds API omitida (falta el secreto ODDS_API_KEY)")
         return {}
     try:
         r = requests.get(f"https://api.the-odds-api.com/v4/sports/{sport}/odds/",
-                         params=dict(apiKey=k, regions="eu,uk", markets="h2h", oddsFormat="decimal"), timeout=30)
+                         params=dict(apiKey=k, regions="eu,uk,us", markets="h2h", oddsFormat="decimal"), timeout=30)
         r.raise_for_status()
         out = {}
         for ev in r.json():
@@ -852,7 +1294,16 @@ def futbol():
                 diag(f"{liga} próximo: {p['Date'].date()} {p['h']} vs {p['a']} [{p.get('src', '?')}]")
             nombres = sorted(set(hist.h) | set(hist.a))
             odds = momios_api(SPORT_KEY[liga], nombres)
+            # Momios: fixtures.csv → The Odds API → ESPN. Solo se consulta ESPN para los partidos que aún no tienen
+            faltan_d = {p["Date"].date() for p in prox if not all(p["cu"]) and (p["h"], p["a"]) not in odds}
+            odds_esp = odds_espn(slug, nombres, faltan_d) if faltan_d else {}
             cargar_logos(slug, nombres)
+
+            # Racha y estrellas (últimos N_FORMA juegos de cada equipo)
+            gl = hist[["Date", "h", "a", "FTHG", "FTAG"]].rename(columns={"FTHG": "gh", "FTAG": "ga"}).copy()
+            gl["gh"], gl["ga"] = pd.to_numeric(gl.gh, errors="coerce"), pd.to_numeric(gl.ga, errors="coerce")
+            gl = gl.dropna(subset=["gh", "ga"])
+            forma = estrellas_liga(gl, ref_hoy)
 
             # ── Resultados de la última semana ──
             sem = hist[(hist.Date >= corte) & (hist.Date < ref_hoy)].sort_values("Date")
@@ -900,18 +1351,19 @@ def futbol():
                         fila("Tiros a puerta totales", tp, "p", None, 8.5),
                     ]
                     cu = p["cu"]
-                    if not any(cu):
-                        cu = odds.get((h, a), cu)
+                    if not all(cu):
+                        cu = odds.get((h, a)) or odds_esp.get((h, a)) or cu
                     con_cuota += 1 if all(cu) else 0
                     probs = [dict(l=l, p=float(pp), c=c) for l, pp, c in zip((h, "Empate", a), (p1, px, p2), cu)]
-                    form = [racha(hist, h, "h", "a", "FTHG", "FTAG", ref_hoy),
-                            racha(hist, a, "h", "a", "FTHG", "FTAG", ref_hoy)]
                     out.append(dict(sp="FUT", lg=liga, date=str(p["Date"].date()), home=h, away=a,
                                     logo_h=logo(h, "FUT"), logo_a=logo(a, "FUT"),
-                                    proy=[round(lh, 2), round(la, 2)], rows=rows, probs=probs, form=form, ia=""))
+                                    proy=[round(lh, 1), round(la, 1)], rows=rows, probs=probs, ia="",
+                                    racha=dict(h=racha_equipo(gl, h, ref_hoy), a=racha_equipo(gl, a, ref_hoy)),
+                                    forma=dict(h=forma.get(h), a=forma.get(a))))
                 except Exception as e:
                     diag(f"{liga} próximo {p.get('h')}-{p.get('a')}: {e}")
-            diag(f"{liga}: {con_cuota} de {len(prox)} partidos con momios 1X2")
+            diag(f"{liga}: {con_cuota} de {len(prox)} partidos con momios 1X2"
+                 + ("" if con_cuota == len(prox) else " (las casas publican ~1-2 semanas antes; el resto usa el momio justo del modelo)"))
         except Exception as e:
             diag(f"[{liga}] omitida: {type(e).__name__}: {e}")
 
@@ -937,15 +1389,14 @@ HTML_PART1 = r"""<!doctype html><html lang="es"><head><meta charset="utf-8">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <meta name="apple-mobile-web-app-title" content="Edge Lab"><meta name="theme-color" content="#090912">
 <title>Edge Lab · Apuestas</title>
-<link rel="icon" href="icon.png">
-<link rel="apple-touch-icon" href="icon.png">
+<link rel="apple-touch-icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' fill='%23090912'/%3E%3Ctext x='50' y='64' font-size='46' text-anchor='middle' fill='%23d6264f' font-family='Arial' font-weight='900'%3E%2F%2F%2F%3C/text%3E%3C/svg%3E">
 <link href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@600;700;800&family=Barlow:wght@400;500&display=swap" rel="stylesheet">
 <style>
 :root{--bg:#090912;--card:#11112a;--line:#2a1b3a;--red:#d6264f;--tx:#e9e9f2;--mut:#8a8aa3;--ok:#3c7a4a;--wrong:#e03e3e}
 *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
 html{-webkit-text-size-adjust:100%;text-size-adjust:100%}
-body{margin:0;overflow-x:hidden;overflow-x:clip;min-height:100vh;min-height:100dvh;background:radial-gradient(1200px 500px at 50% -100px,#2a0f26 0,transparent 70%),var(--bg);color:var(--tx);font-family:Barlow,-apple-system,sans-serif;padding-bottom:env(safe-area-inset-bottom)}
-header.hd{position:-webkit-sticky;position:sticky;top:0;z-index:50;background:rgba(9,9,18,.88);-webkit-backdrop-filter:blur(14px);backdrop-filter:blur(14px);padding-top:env(safe-area-inset-top)}
+body{margin:0;overflow-x:hidden;min-height:100vh;background:radial-gradient(1200px 500px at 50% -100px,#2a0f26 0,transparent 70%),var(--bg);background-attachment:fixed;color:var(--tx);font-family:Barlow,-apple-system,sans-serif;padding-bottom:env(safe-area-inset-bottom)}
+header.top{position:sticky;top:0;z-index:50;background:rgba(9,9,18,.88);-webkit-backdrop-filter:blur(14px);backdrop-filter:blur(14px);padding-top:env(safe-area-inset-top)}
 /* ticker */
 .tick{overflow:hidden;border-bottom:1px solid #1d1530;background:#0c0c1e;height:34px;display:flex;align-items:center}
 .tick .lbl{flex:none;background:var(--red);color:#fff;font:800 12px 'Barlow Condensed';letter-spacing:.16em;padding:0 12px;height:100%;display:flex;align-items:center;z-index:2}
@@ -957,10 +1408,11 @@ header.hd{position:-webkit-sticky;position:sticky;top:0;z-index:50;background:rg
 .ti .lg2{color:var(--red);font-size:11px;letter-spacing:.16em}.ti img{width:18px;height:18px;object-fit:contain}
 .ti em{font-style:normal;color:#fff;font-size:15px}.ti .ok{color:#6fd08a}.ti .no{color:var(--wrong)}
 @media(prefers-reduced-motion:reduce){.tk{-webkit-animation:none;animation:none}.trk{overflow-x:auto}}
-nav{display:flex;align-items:center;gap:30px;padding:12px 40px;border-bottom:1px solid #1d1530;font-family:'Barlow Condensed';letter-spacing:.14em;font-weight:700;overflow-x:auto;white-space:nowrap;-webkit-overflow-scrolling:touch;scrollbar-width:none}
+nav{display:flex;flex-wrap:wrap;align-items:center;gap:6px 30px;padding:12px 40px;border-bottom:1px solid #1d1530;font-family:'Barlow Condensed';letter-spacing:.14em;font-weight:700;overflow:visible}
 nav::-webkit-scrollbar{display:none}
+.logo{order:1;font-size:26px;line-height:1.25;letter-spacing:.06em;cursor:pointer;flex:none;white-space:nowrap}.logo i{color:var(--red);font-style:normal}
 nav a{cursor:pointer;color:var(--mut);font-size:15px;padding:8px 0;transition:.2s;flex:none}nav a.on{color:var(--red);border-bottom:2px solid var(--red)}
-.fmt{margin-left:auto;flex:none;background:transparent;border:1px solid var(--red);color:var(--red);border-radius:20px;padding:8px 16px;cursor:pointer;font:700 13px 'Barlow Condensed';letter-spacing:.14em;text-transform:uppercase;-webkit-appearance:none}
+.fmt{order:2;margin-left:auto;flex:none;background:transparent;border:1px solid var(--red);color:var(--red);border-radius:20px;padding:8px 16px;cursor:pointer;font:700 13px 'Barlow Condensed';letter-spacing:.14em;text-transform:uppercase;-webkit-appearance:none}
 .fmt:hover{background:var(--red);color:#fff}
 main{padding:30px 40px;max-width:1500px;margin:0 auto}
 h1{font:800 56px 'Barlow Condensed';margin:0;text-transform:uppercase;line-height:1}h1 span,h1 i{color:var(--red);font-style:italic}
@@ -975,7 +1427,8 @@ h1{font:800 56px 'Barlow Condensed';margin:0;text-transform:uppercase;line-heigh
 .tbg img{position:absolute;width:110px;height:110px;object-fit:contain;opacity:.16;filter:drop-shadow(0 0 20px rgba(0,0,0,.5))}
 .tbg img:nth-child(1){right:-10px;top:-10px;transform:rotate(12deg)}.tbg img:nth-child(2){right:90px;top:50px;transform:rotate(-8deg);width:90px;height:90px}
 .tbg img:nth-child(3){right:10px;top:110px;transform:rotate(6deg);width:80px;height:80px}.tbg img:nth-child(4){right:110px;top:-20px;width:70px;height:70px;transform:rotate(-14deg)}
-.tic{position:absolute;top:18px;left:22px;font-size:46px;line-height:1;filter:drop-shadow(0 4px 12px rgba(0,0,0,.5))}
+/* el icono va en el flujo (no absoluto): así nunca se encima con el título; margin-bottom:auto lo mantiene arriba */
+.tic{position:relative;margin-bottom:auto;padding-bottom:14px;font-size:46px;line-height:1;filter:drop-shadow(0 4px 12px rgba(0,0,0,.5))}
 .tile h2{position:relative;margin:0;font:800 40px 'Barlow Condensed';text-transform:uppercase;letter-spacing:.04em}
 .tile p{position:relative;margin:4px 0 10px;color:#c9c9dc;font-size:14px}
 .tile .nx{position:relative;color:var(--mut);font-size:12px;margin-bottom:12px;min-height:15px}
@@ -991,16 +1444,19 @@ h1{font:800 56px 'Barlow Condensed';margin:0;text-transform:uppercase;line-heigh
 .badge.incorrecto{background:var(--wrong)}
 .val{font:800 12px 'Barlow Condensed';letter-spacing:.12em;color:#6fd08a;margin-right:8px}
 .fecha{color:var(--red);font:700 13px 'Barlow Condensed';letter-spacing:.16em;margin:6px 0 18px;text-transform:uppercase}
-.vs{display:flex;align-items:center;justify-content:space-between;gap:8px}.eq{text-align:center;flex:1;min-width:0}
+.vs{display:flex;align-items:flex-start;justify-content:space-between;gap:8px}.vs .sc,.vs .scw{align-self:center}.eq{text-align:center;flex:1;min-width:0}
 .ci{width:64px;height:64px;border-radius:50%;background:linear-gradient(135deg,#1b0f2e,#11112a);border:1px solid var(--line);margin:0 auto 8px;display:grid;place-items:center;overflow:hidden;font:800 20px 'Barlow Condensed';color:var(--mut)}
 .ci img{width:80%;height:80%;object-fit:contain}
 .eq b{font:700 18px 'Barlow Condensed';text-transform:uppercase;display:block;margin-top:4px}.sc{font:800 44px 'Barlow Condensed';white-space:nowrap}
-/* racha últimos 5 */
-.fm{display:flex;gap:4px;justify-content:center;margin-top:6px}
-.fm i{width:7px;height:7px;border-radius:50%;background:#555570}
-.fm i.G{background:#6fd08a}.fm i.E{background:#b8861b}.fm i.P{background:#e03e3e}
 .scw{text-align:center}.pj{font:700 12px 'Barlow Condensed';letter-spacing:.14em;color:var(--mut);text-transform:uppercase;white-space:nowrap}
 .pj.p{color:#c9c9dc;margin-bottom:2px}
+/* racha y bajas (debajo de cada equipo) */
+.rt{font:700 10px 'Barlow Condensed';letter-spacing:.16em;color:var(--mut);margin-top:8px}
+.rc{display:flex;gap:3px;justify-content:center;margin-top:3px}
+.rc i{font:800 10px 'Barlow Condensed';font-style:normal;width:17px;height:17px;border-radius:4px;display:grid;place-items:center;color:#fff}
+.rc i.G{background:var(--ok)}.rc i.P{background:var(--wrong)}.rc i.E{background:#555570}
+.les{margin-top:6px;font-size:11px;line-height:1.35;color:#ff9a9a;overflow-wrap:break-word}
+.les.ok{color:#6fd08a}
 .pr{display:flex;height:6px;border-radius:3px;overflow:hidden;margin:16px 0 4px}
 .pl{display:flex;justify-content:space-between;font-size:12px;color:var(--mut);gap:6px}
 /* desplegable de momios */
@@ -1009,15 +1465,27 @@ h1{font:800 56px 'Barlow Condensed';margin:0;text-transform:uppercase;line-heigh
 .ar{display:inline-block;color:var(--red);font-size:16px;transition:transform .25s}
 .mx.open .ar{transform:rotate(180deg)}.mx.open .mbtn{border-color:var(--red)}
 .mbody{display:none}.mx.open .mbody{display:block}
-.edge{overflow:hidden;margin-top:14px;border:1px solid var(--line);border-radius:10px;padding:10px 12px;background:#0e0e24}
-.edge h4{display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;margin:0 0 8px;font:800 13px 'Barlow Condensed';letter-spacing:.16em;color:var(--red)}
+.edge,.fm{overflow:hidden;margin-top:14px;border:1px solid var(--line);border-radius:10px;padding:10px 12px;background:#0e0e24}
+.edge h4,.fm h4{display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;margin:0 0 8px;font:800 13px 'Barlow Condensed';letter-spacing:.16em;color:var(--red)}
 .fmt2{flex:none;background:transparent;border:1px solid var(--red);color:var(--red);border-radius:16px;padding:5px 12px;cursor:pointer;font:700 12px 'Barlow Condensed';letter-spacing:.12em;text-transform:uppercase;-webkit-appearance:none;appearance:none}
 .fmt2:active{background:var(--red);color:#fff}
-.eo{display:grid;grid-template-columns:minmax(0,1fr) auto 70px 64px;gap:8px;align-items:center;font-size:13px;padding:3px 0}.eo>*{min-width:0}.eo>span:first-child{overflow-wrap:anywhere}
+.eo{display:grid;grid-template-columns:minmax(0,1fr) auto auto 64px;gap:8px;align-items:center;font-size:13px;padding:3px 0}.eo>*{min-width:0}.eo>span:first-child{overflow-wrap:anywhere}
 .eo .fj{color:var(--mut);font-size:12px;white-space:nowrap}.eo .ed{font-weight:700;text-align:right}
+.nm{color:var(--mut);font-size:11px;line-height:1.4;margin-top:6px}
+/* estrellas ofensiva / defensiva */
+.fb b{font:700 14px 'Barlow Condensed';letter-spacing:.06em;text-transform:uppercase;display:block;margin:8px 0 2px}
+.fr{display:grid;grid-template-columns:70px auto minmax(0,1fr);gap:8px;align-items:center;font-size:12px;padding:2px 0}
+.fr span:last-child{color:var(--mut);font-size:11px}
+.st{color:#f5b301;letter-spacing:1px;font-size:14px;white-space:nowrap}.st s{text-decoration:none;opacity:.2}
 table{width:100%;border-collapse:collapse;margin-top:16px;font-size:13px}td{padding:6px 4px;border-top:1px solid #1d1d3a}td:nth-child(2){color:var(--mut)}
+tr.sp td{border-top:2px solid var(--red);padding-top:10px;color:var(--red);font:800 11px 'Barlow Condensed';letter-spacing:.14em;text-transform:uppercase;white-space:normal}
+tr.hd td{color:var(--mut);font:700 11px 'Barlow Condensed';letter-spacing:.12em;text-transform:uppercase;border-top:0;white-space:nowrap}
 input{width:62px;background:#0c0c1e;border:1px solid var(--line);border-radius:6px;color:var(--tx);padding:5px 6px;-webkit-appearance:none;appearance:none}
 .eo input{width:70px}
+/* campo + botón ± (el teclado decimal de iOS no trae el signo menos) */
+.ib{display:inline-flex;gap:3px;align-items:center;white-space:nowrap}
+.sg{flex:none;width:26px;height:30px;padding:0;background:transparent;border:1px solid var(--red);color:var(--red);border-radius:6px;font:800 15px 'Barlow Condensed';cursor:pointer;-webkit-appearance:none;appearance:none}
+.sg:active{background:var(--red);color:#fff}
 .g{color:#6fd08a;font-weight:500}
 .ctx{margin-top:12px;color:var(--mut);font-size:12px;border-left:2px solid var(--red);padding-left:10px}
 .ai{border:1px solid #6b2a5a;background:linear-gradient(135deg,#1b0f2e,#2a0f26);border-radius:14px;padding:18px 22px;margin-bottom:22px;line-height:1.55;color:#e9d5ff}.ai h3{margin:0 0 6px;font:800 16px 'Barlow Condensed';letter-spacing:.16em;color:var(--red)}
@@ -1027,26 +1495,33 @@ input{width:62px;background:#0c0c1e;border:1px solid var(--line);border-radius:6
 .pk .cf{font:800 12px 'Barlow Condensed';letter-spacing:.12em;border-radius:12px;padding:2px 10px;white-space:nowrap;background:#555570}
 .pk .cf.alta{background:var(--ok)}.pk .cf.media{background:#b8861b}
 .pk small{color:var(--mut);display:block}.pk b{color:#fff}
-.tabs{display:flex;gap:30px;flex:none}.tw{overflow-x:auto;-webkit-overflow-scrolling:touch}.tw table{margin-top:12px}td{overflow-wrap:anywhere}
+.tabs{order:3;width:100%;display:flex;gap:30px;flex:none;overflow-x:auto;-webkit-overflow-scrolling:touch;scrollbar-width:none}.tabs::-webkit-scrollbar{display:none}.tw{overflow-x:auto;-webkit-overflow-scrolling:touch}.tw table{margin-top:12px}
+td{overflow-wrap:break-word}td:nth-child(2),td:nth-child(3){white-space:nowrap}td:nth-child(4){min-width:112px}
 .tag{background:#2a1b3a;color:#e9d5ff;border-radius:8px;padding:1px 8px;margin-left:6px;font-size:11px}
 .diag{color:var(--mut);font-size:12px;line-height:1.6;margin-top:10px;white-space:pre-wrap}
+/* aviso de QB y escenario "si no juega" */
+.qbn{margin-top:12px;font-size:12px;line-height:1.5;color:#ffd27a;border-left:2px solid #f5b301;padding-left:10px}
+.alt{margin-top:16px;border:1px dashed #6b2a5a;border-radius:10px;padding:10px 12px;background:#0e0e24}
+.alt h4{margin:0 0 6px;font:800 13px 'Barlow Condensed';letter-spacing:.14em;color:#f5b301}
 .nota{color:var(--mut);font-size:12px;margin-top:26px}
 @media(pointer:coarse){input,.eo input{font-size:16px}}   /* evita el zoom automático de Safari al escribir */
 @media(max-width:640px){
  main{padding:20px 16px calc(24px + env(safe-area-inset-bottom))}nav{padding:10px 16px;gap:20px}h1{font-size:40px}
  .card{padding:18px 16px}.sc{font-size:34px}.eq b{font-size:15px}.ci{width:52px;height:52px}
- nav{flex-wrap:wrap;overflow:visible;row-gap:6px}.fmt{order:2;padding:6px 12px}
- .tabs{order:1;width:100%;gap:22px;overflow-x:auto;-webkit-overflow-scrolling:touch;scrollbar-width:none}.tabs::-webkit-scrollbar{display:none}
- .eo{grid-template-columns:minmax(0,1fr) 84px 58px;gap:6px}.eo .fj{grid-column:1/-1;order:3;white-space:normal}.eo input{width:84px}
- table{font-size:12px}td{padding:6px 3px}.g{font-size:11px}
- .tile{min-height:180px;padding:20px}.tile h2{font-size:34px}
+ nav{flex-wrap:wrap;overflow:visible;row-gap:6px}.logo{order:1;font-size:22px}.fmt{order:2;padding:6px 12px}
+ .tabs{order:3;width:100%;gap:22px;overflow-x:auto;-webkit-overflow-scrolling:touch;scrollbar-width:none}.tabs::-webkit-scrollbar{display:none}
+ .eo{grid-template-columns:minmax(0,1fr) auto 58px;gap:6px}.eo .fj{grid-column:1/-1;order:3;white-space:normal}.eo input{width:70px}
+ table{font-size:12px}td{padding:6px 3px}.g{font-size:11px}.tw input{width:54px}
+ .tile{min-height:190px;padding:20px}.tile h2{font-size:34px}.tic{font-size:38px}
+ .tbg img:nth-child(n+3){display:none}
+ .rc i{width:15px;height:15px;font-size:9px}.les{font-size:10px}
+ .fr{grid-template-columns:62px auto minmax(0,1fr)}
 }
 </style></head><body>
-<header class="hd">
+<header class="top">
 <div class="tick" id="tick"></div>
-<nav>
-<div class="tabs"><a id="tHOME" onclick="setTab('HOME')">⌂ HOME</a>
-<a id="tNFL" onclick="setTab('NFL')">NFL</a>
+<nav><div class="logo" onclick="setTab('HOME')">EDGE<i>///</i>LAB</div>
+<div class="tabs"><a id="tNFL" onclick="setTab('NFL')">NFL</a>
 <a id="tFUT" onclick="setTab('FUT')">FÚTBOL</a>
 <a id="tCL" onclick="setTab('CL')">CHAMPIONS</a>
 <a id="tRES" onclick="setTab('RES')">RESULTADOS</a></div>
@@ -1054,8 +1529,7 @@ input{width:62px;background:#0c0c1e;border:1px solid var(--line);border-radius:6
 </nav></header>
 <main><h1 id="ttl"></h1><div id="descr" class="sub"></div>
 <div id="home" class="lobby"></div>
-<div id="ai"></div><div id="picks"></div><div class="chips" id="chips"></div><div class="grid" id="grid"></div><div class="nota">Modelo estadístico (Ridge / Poisson / Normal). Edge = probabilidad del modelo × cuota decimal − 1 (el momio de la casa ya incluye su margen). Puedes escribir tu momio en americano (+150, -110) o decimal (2.50): se detecta solo. 🏠 = equipo local. Puntos bajo cada equipo = racha de sus últimos 5 partidos (verde ganó, ámbar empató, rojo perdió; el más reciente a la derecha). Los picks de Gemini combinan tu modelo con noticias de la web y pueden fallar. Solo informativo, no es asesoría financiera. En Resultados se visualizan exclusivamente filas con datos reales.</div></main>"""
-
+<div id="ai"></div><div id="picks"></div><div class="chips" id="chips"></div><div class="grid" id="grid"></div><div class="nota">Modelo estadístico (Ridge / Poisson / Normal). Edge = probabilidad del modelo × cuota decimal − 1 (el momio de la casa ya incluye su margen). Puedes escribir tu momio en americano (+150, -110) o decimal (2.50): se detecta solo; con el botón ± cambias el signo. 🏠 = equipo local. Racha = últimos 5 juegos (G ganó · E empató · P perdió). Estrellas 1-5 = ranking de todos los equipos de la liga con sus últimos 5 juegos: puntos/goles a favor (ofensiva) y en contra (defensiva), ajustados por la calidad del rival; 5 = el 20 % mejor. Bajas = reporte de lesiones de ESPN/nflverse (gana el reporte más reciente); los jugadores que no jugarán (Out, IR, PUP, suspendidos) se excluyen de las apuestas; los dudables (Questionable, Doubtful, Day-To-Day) aparecen marcados con DUDA: su fila normal va arriba y la del suplente (si no juega) hasta abajo. Ajuste de QB: el valor del mariscal titular sobre su suplente se mide con EPA por jugada; si está fuera el modelo ya resta esos puntos, y si está dudoso la tabla asume que juega y abajo aparece el escenario "si no juega". Cifras redondeadas, salvo proyecciones, spread y total. Los picks de Gemini combinan tu modelo con noticias de la web y pueden fallar. Solo informativo, no es asesoría financiera. En Resultados se visualizan exclusivamente filas con datos reales.</div></main>"""
 
 HTML_PART2_JS = r"""<script>
 const D = __DATA__;
@@ -1065,9 +1539,13 @@ const ROWS = [], ROWK = [], PR = [], PRK = [], CK = [];
 const ODDS = {}, LINES = {}, OPEN = new Set();
 const TT = {NFL:'NFL', FUT:'Fútbol', CL:'Champions', RES:'Resultados'};
 const SUB = {NFL:'Semana actual · modelo vs. mercado', FUT:'La Liga y Premier League', CL:'UEFA Champions League', RES:'Lo que proyectó el modelo vs. lo que pasó realmente'};
+const EST = {'out':'FUERA', 'doubtful':'DUDOSO', 'questionable':'DUDA', 'injured reserve':'IR', 'ir':'IR', 'day-to-day':'DÍA A DÍA', 'pup':'PUP', 'suspension':'SUSP.'};
 
 const toUS = d => d >= 2 ? '+' + Math.round((d - 1) * 100) : '-' + Math.round(100 / (d - 1));
 const fmtO = d => (d == null || !isFinite(d) || d <= 1) ? '' : (FMT === 'us' ? toUS(d) : d.toFixed(2));
+const f1 = x => (x == null || isNaN(x)) ? '' : Number(x).toFixed(1);   // proyecciones, spread y total: 1 decimal
+const f0 = x => (x == null || isNaN(x)) ? '' : Math.round(x);          // todo lo demás: entero
+const KEEP = l => /Spread|Total de puntos|Goles totales/.test(l);      // filas que conservan 1 decimal
 function parseO(s) {
   s = String(s).trim().replace(',', '.');
   if (s === '') return null;
@@ -1077,6 +1555,16 @@ function parseO(s) {
   return v > 1 ? v : null;
 }
 function toggleFmt() { FMT = FMT === 'us' ? 'dec' : 'us'; render(); }
+
+// botón ±: cambia el signo del campo anterior (el teclado decimal del teléfono no tiene "-")
+function neg(b) {
+  const i = b.parentNode.querySelector('input');
+  let v = i.value.trim();
+  v = v === '' ? '-' : (v[0] === '-' ? v.slice(1) : '-' + v);
+  i.value = v;
+  i.dispatchEvent(new Event('input'));
+  i.focus();
+}
 
 const erf = x => {
   const s = Math.sign(x); x = Math.abs(x);
@@ -1100,7 +1588,7 @@ function txt(r, line) {
 function upd(i) {
   const v = document.getElementById('i' + i).value;
   LINES[ROWK[i]] = v;
-  document.getElementById('o' + i).textContent = v === '' ? '' : txt(ROWS[i], parseFloat(v));
+  document.getElementById('o' + i).textContent = v === '' ? '' : txt(ROWS[i], parseFloat(v.replace(',', '.')));
 }
 function edge(gid) {
   let best = null;
@@ -1111,31 +1599,47 @@ function edge(gid) {
     if (d == null || d <= 1) { el.innerHTML = ''; return; }
     const e = x.p * d - 1;
     if (best == null || e > best) best = e;
-    el.innerHTML = `<span style="color:${e >= 0 ? '#6fd08a' : '#e03e3e'}">${e >= 0 ? '+' : ''}${(e * 100).toFixed(1)}%</span>`;
+    el.innerHTML = `<span style="color:${e >= 0 ? '#6fd08a' : '#e03e3e'}">${e >= 0 ? '+' : ''}${(e * 100).toFixed(0)}%</span>`;
   });
   const b = document.getElementById('b' + gid);
-  if (b) b.textContent = (best != null && best > 0) ? `VALOR +${(best * 100).toFixed(1)}%` : '';
+  if (b) b.textContent = (best != null && best > 0) ? `VALOR +${(best * 100).toFixed(0)}%` : '';
 }
 function setOdd(gid, k, val) { ODDS[PRK[gid] + '|' + k] = parseO(val); edge(gid); }
 
 function rowH(r, hist, mk) {
   const i = ROWS.push(r) - 1;
   ROWK[i] = mk + '|' + r.l;
-  if (hist) return `<tr><td>${r.l}</td><td>${r.m}</td><td>${r.real ?? '–'}</td></tr>`;
+  const esP = r.p != null || r.o === 'Sí';                       // filas de probabilidad (Ambos anotan)
+  const mv = esP ? Math.round(r.m * 100) + '%' : (KEEP(r.l) ? f1(r.m) : f0(r.m));   // modelo: entero (1 decimal solo spread/total)
+  if (hist) return `<tr><td>${r.l}</td><td>${mv}</td><td>${r.o === 'Sí' ? (r.real ? 'Sí' : 'No') : (r.real ?? '–')}</td></tr>`;
   const lv = ROWK[i] in LINES ? LINES[ROWK[i]] : (r.line ?? '');
-  const inp = r.p != null ? '' : `<input id="i${i}" type="number" inputmode="decimal" step="0.5" value="${lv}" oninput="upd(${i})">`;
-  return `<tr><td>${r.l}</td><td>${r.m}</td><td>${inp}</td><td class="g" id="o${i}">${txt(r, lv === '' ? null : parseFloat(lv))}</td></tr>`;
+  const inp = r.p != null ? '' : `<span class="ib"><input id="i${i}" type="text" inputmode="decimal" autocomplete="off" autocapitalize="off" spellcheck="false" value="${lv}" oninput="upd(${i})"><button type="button" class="sg" onclick="neg(this)">±</button></span>`;
+  const sp = r.sep ? '<tr class="sp"><td colspan="4">Si no juega el dudoso · alternativa</td></tr>' : '';
+  return `${sp}<tr><td>${r.l}</td><td>${mv}</td><td>${inp}</td><td class="g" id="o${i}">${txt(r, lv === '' ? null : parseFloat(String(lv).replace(',', '.')))}</td></tr>`;
 }
 const ini = n => n.split(/\s+/).map(w => w[0]).join('').slice(0, 3).toUpperCase();
 const esc = s => String(s ?? '').replace(/[&<>]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]));
 
-// racha de los últimos 5: G ganó, E empató, P perdió (el más reciente a la derecha)
-const FN = { G: 'Ganó', E: 'Empató', P: 'Perdió' };
-const dots = f => (f && f.length) ? `<div class="fm" aria-label="Últimos ${f.length} partidos">${f.map(x => `<i class="${x}" title="${FN[x]}"></i>`).join('')}</div>` : '';
-
-function team(n, logo, loc, f) {
+// equipo + racha (últimos 5) + bajas clave debajo
+function team(n, logo, loc, rc, les) {
   const img = logo ? `<img src="${logo}" onerror="this.parentNode.textContent='${ini(n).replace(/'/g, '')}'">` : ini(n);
-  return `<div class="eq"><div class="ci">${img}</div><b>${loc ? '🏠 ' : ''}${n}</b>${dots(f)}</div>`;
+  const chips = rc ? `<div class="rt">RACHA</div><div class="rc">${[...rc].map(c => `<i class="${c}">${c}</i>`).join('')}</div>` : '';
+  let lh = '';
+  if (les) lh = les.length
+    ? `<div class="les">${les.map(x => `⚠ ${esc(x.pos)} ${esc(x.n)} · ${EST[String(x.est).toLowerCase()] || esc(x.est)}`).join('<br>')}</div>`
+    : '<div class="les ok">✓ Sin bajas clave</div>';
+  return `<div class="eq"><div class="ci">${img}</div><b>${loc ? '🏠 ' : ''}${n}</b>${chips}${lh}</div>`;
+}
+
+const star = n => `<span class="st">${'★'.repeat(n)}<s>${'★'.repeat(5 - n)}</s></span>`;
+function formaH(g) {
+  if (!g.forma) return '';
+  const u = g.sp === 'NFL' ? 'pts' : 'goles';
+  const b = (nom, f) => f ? `<div class="fb"><b>${esc(nom)}</b>
+    <div class="fr"><span>Ofensiva</span>${star(f.of)}<span>${f0(f.gf)} ${u}/juego</span></div>
+    <div class="fr"><span>Defensiva</span>${star(f.de)}<span>${f0(f.gc)} ${u} en contra</span></div></div>` : '';
+  const x = b(g.home, g.forma.h) + b(g.away, g.forma.a);
+  return x ? `<div class="fm"><h4><span>FORMA · ÚLTIMOS 5 JUEGOS</span></h4>${x}</div>` : '';
 }
 
 // desplegable
@@ -1152,7 +1656,7 @@ function card(g, hist) {
   const abierto = OPEN.has(mk);
   const mid = hist
     ? `<div class="scw"><div class="pj p">Proyección ${g.proy[0]} - ${g.proy[1]}</div><div class="sc">${g.real[0]} - ${g.real[1]}</div><div class="pj">Resultado real</div></div>`
-    : `<div class="sc">${g.proy[0]} - ${g.proy[1]}</div>`;
+    : `<div class="sc">${f1(g.proy[0])} - ${f1(g.proy[1])}</div>`;
   const badge = hist ? `<span class="badge ${g.atino === 'SI' ? '' : 'incorrecto'}">${g.atino === 'SI' ? 'ACERTÓ' : 'FALLÓ'}</span>` : '';
 
   let pr = '', edgeH = '', valB = '';
@@ -1163,27 +1667,39 @@ function card(g, hist) {
     pr = `<div class="pr">${g.probs.map((x, k) => `<div style="width:${(x.p * 100).toFixed(1)}%;background:${cols[k]}"></div>`).join('')}</div>
           <div class="pl">${g.probs.map(x => `<span>${x.l} ${(x.p * 100).toFixed(0)}%</span>`).join('')}</div>`;
     valB = `<span class="val" id="b${gid}"></span>`;
+    const sinC = g.probs.every(x => x.c == null);
     edgeH = `<div class="edge"><h4><span>EDGE · RESULTADO</span><button class="fmt2" onclick="toggleFmt()">${FMT === 'us' ? 'Americano' : 'Decimal'} ⇄</button></h4>${g.probs.map((x, k) => {
       const key = mk + '|' + k;
       const d = key in ODDS ? ODDS[key] : x.c;
       const pj = Math.min(0.995, Math.max(0.005, x.p));
       return `<div class="eo"><span>${x.l}</span><span class="fj">${(x.p * 100).toFixed(0)}% · justo ${fmtO(1 / pj)}</span>
-        <input type="text" inputmode="decimal" placeholder="momio" value="${fmtO(d)}" oninput="setOdd(${gid},${k},this.value)">
+        <span class="ib"><input type="text" inputmode="decimal" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="momio" value="${fmtO(d)}" oninput="setOdd(${gid},${k},this.value)"><button type="button" class="sg" onclick="neg(this)">±</button></span>
         <span class="ed" id="e${gid}_${k}"></span></div>`;
-    }).join('')}</div>`;
+    }).join('')}${sinC ? '<div class="nm">Las casas aún no publican momios de este partido (suelen salir 1-2 semanas antes). Usa el momio justo del modelo como referencia o escribe el tuyo para ver el edge.</div>' : ''}</div>`;
   }
-  const head = hist ? '<tr><td>Métrica</td><td>Proyectado</td><td>Real</td></tr>' : '<tr><td></td><td>Modelo</td><td>Tu línea</td><td>Prob · momio justo</td></tr>';
+  const head = hist ? '<tr class="hd"><td>Métrica</td><td>Proyectado</td><td>Real</td></tr>' : '<tr class="hd"><td></td><td>Modelo</td><td>Tu línea</td><td>Prob · justo</td></tr>';
   const ctx = hist ? '' : (g.ia ? `<div class="ctx">${g.ia}</div>` : '');
   const etq = hist ? 'Proyección vs. real' : 'Momios y mercados';
+
+  // aviso del QB (visible siempre) y escenario "si no juega" (hasta abajo del desplegable)
+  const EQ = q => q.estado === 'fuera' ? 'FUERA' : (EST[String(q.est).toLowerCase()] || esc(q.est));
+  const qbH = (!hist && g.qb && g.qb.length) ? `<div class="qbn">${g.qb.map(q => q.estado === 'fuera'
+    ? `🚑 QB ${esc(q.n)} (${esc(q.eq)}) · ${EQ(q)} → el modelo ya le resta ${Math.abs(q.adj).toFixed(1)} pts a ${esc(q.eq)} (entra ${esc(q.bk)})`
+    : `⚠ QB ${esc(q.n)} (${esc(q.eq)}) · ${EQ(q)} → la tabla asume que juega; si no juega son ${q.fuera.toFixed(1)} pts (abajo)`).join('<br>')}</div>` : '';
+  const altH = (!hist && g.alt && g.alt.length) ? g.alt.map(a => `<div class="alt"><h4>SI NO JUEGA ${esc(a.qb)} (${esc(a.eq)})</h4>
+    <div class="pj p">Proyección ${f1(a.proy[0])} - ${f1(a.proy[1])} · ${esc(g.home)} gana ${Math.round(a.p_h * 100)}%</div>
+    <div class="tw"><table><tr class="hd"><td></td><td>Modelo</td><td>Tu línea</td><td>Prob · justo</td></tr>${a.rows.map(r => rowH(r, false, mk)).join('')}</table></div>
+    <div class="nm">Entra ${esc(a.bk)} · ${a.pen.toFixed(1)} pts para ${esc(a.eq)}</div></div>`).join('') : '';
 
   return `<div class="card">
     <div class="top"><span class="lg">${g.lg}</span><span>${valB}${badge}</span></div>
     <div class="fecha">${g.date}${g.week ? ` · SEMANA ${g.week}` : ''}${g.div ? '<span class="tag">DIVISIONAL</span>' : ''}</div>
-    <div class="vs">${team(g.home, g.logo_h, true, g.form && g.form[0])}${mid}${team(g.away, g.logo_a, false, g.form && g.form[1])}</div>
+    <div class="vs">${team(g.home, g.logo_h, true, g.racha && g.racha.h, g.les ? g.les.h : null)}${mid}${team(g.away, g.logo_a, false, g.racha && g.racha.a, g.les ? g.les.a : null)}</div>
     ${pr}
+    ${qbH}
     <div class="mx ${abierto ? 'open' : ''}" id="m${ci}">
       <button class="mbtn" aria-expanded="${abierto}" onclick="tog(${ci})"><span>${etq}</span><span class="ar">▾</span></button>
-      <div class="mbody">${edgeH}<div class="tw"><table>${head}${g.rows.map(r => rowH(r, hist, mk)).join('')}</table></div></div>
+      <div class="mbody">${edgeH}${hist ? '' : formaH(g)}<div class="tw"><table>${head}${g.rows.map(r => rowH(r, hist, mk)).join('')}</table></div>${altH}</div>
     </div>
     ${ctx}
   </div>`;
@@ -1242,7 +1758,7 @@ function setLg(l) { lg = l; render(); }
 
 function render() {
   ROWS.length = 0; ROWK.length = 0; PR.length = 0; PRK.length = 0; CK.length = 0;
-  ['HOME', 'NFL', 'FUT', 'CL', 'RES'].forEach(k => document.getElementById('t' + k).classList.toggle('on', k === tab));
+  ['NFL', 'FUT', 'CL', 'RES'].forEach(k => document.getElementById('t' + k).classList.toggle('on', k === tab));
   document.getElementById('fmtbtn').textContent = (FMT === 'us' ? 'Americano' : 'Decimal') + ' ⇄';
 
   const home = tab === 'HOME', hist = tab === 'RES';
@@ -1303,6 +1819,7 @@ def main():
     for clave, dep, lst in grupos:
         fx = [dict(id=f"{g['home']}-{g['away']}", date=g["date"], home=g["home"], away=g["away"],
                    semana=g.get("week"), divisional=g.get("div"), proy=g["proy"],
+                   racha=g.get("racha"), bajas=g.get("les"), qb_ajuste=g.get("qb"),
                    probs=[dict(l=x["l"], p=round(x["p"], 3), cuota=x["c"]) for x in g["probs"]],
                    mercados=[dict(m=r["l"], modelo=r["m"], linea=r["line"], prob_si=r["p"]) for r in g["rows"]])
               for g in lst]
@@ -1315,9 +1832,7 @@ def main():
         for g in lst:
             g["ia"] = aj.get(f"{g['home']}-{g['away']}", {}).get("notas", "")
     data = dict(nfl=nfl_p, nflhist=nfl_h, fut=fut_p, futhist=fut_h, ai=resumen, picks=picks, diag=DIAG)
-    # "</" escapado: evita que un texto de la IA con </script> rompa la página
-    payload = json.dumps(data, ensure_ascii=False, default=str).replace("</", "<\\/")
-    html = HTML_PART1 + HTML_PART2_JS.replace("__DATA__", payload)
+    html = HTML_PART1 + HTML_PART2_JS.replace("__DATA__", json.dumps(data, ensure_ascii=False, default=str))
     with open(SALIDA, "w", encoding="utf-8") as f:
         f.write(html)
     print("Listo →", SALIDA)
