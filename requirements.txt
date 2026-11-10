@@ -1,0 +1,8 @@
+numpy
+pandas
+requests
+scikit-learn
+nflreadpy
+polars
+pyarrow
+google-genai
