@@ -937,7 +937,8 @@ HTML_PART1 = r"""<!doctype html><html lang="es"><head><meta charset="utf-8">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <meta name="apple-mobile-web-app-title" content="Edge Lab"><meta name="theme-color" content="#090912">
 <title>Edge Lab · Apuestas</title>
-<link rel="apple-touch-icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' fill='%23090912'/%3E%3Ctext x='50' y='64' font-size='46' text-anchor='middle' fill='%23d6264f' font-family='Arial' font-weight='900'%3E%2F%2F%2F%3C/text%3E%3C/svg%3E">
+<link rel="icon" href="icon.png">
+<link rel="apple-touch-icon" href="icon.png">
 <link href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@600;700;800&family=Barlow:wght@400;500&display=swap" rel="stylesheet">
 <style>
 :root{--bg:#090912;--card:#11112a;--line:#2a1b3a;--red:#d6264f;--tx:#e9e9f2;--mut:#8a8aa3;--ok:#3c7a4a;--wrong:#e03e3e}
