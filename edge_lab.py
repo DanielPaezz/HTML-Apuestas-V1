@@ -451,6 +451,234 @@ def bajas_clave(M, team, ref, inj):
     return out
 
 
+# ── Salario NFL (OverTheCap vía nflverse) para elegir QB reemplazo ──
+# Se usa el salario base de la temporada actual (millones USD); si no existe,
+# se utiliza APY como respaldo. No es salario fantasy ni valor de subasta.
+TEAM_CONTRACT = {
+    "arizona": "ARI", "cardinals": "ARI", "atlanta": "ATL", "falcons": "ATL",
+    "baltimore": "BAL", "ravens": "BAL", "buffalo": "BUF", "bills": "BUF",
+    "carolina": "CAR", "panthers": "CAR", "chicago": "CHI", "bears": "CHI",
+    "cincinnati": "CIN", "bengals": "CIN", "cleveland": "CLE", "browns": "CLE",
+    "dallas": "DAL", "cowboys": "DAL", "denver": "DEN", "broncos": "DEN",
+    "detroit": "DET", "lions": "DET", "green bay": "GB", "packers": "GB",
+    "houston": "HOU", "texans": "HOU", "indianapolis": "IND", "colts": "IND",
+    "jacksonville": "JAX", "jaguars": "JAX", "kansas city": "KC", "chiefs": "KC",
+    "las vegas": "LV", "raiders": "LV", "los angeles rams": "LA", "rams": "LA",
+    "los angeles chargers": "LAC", "chargers": "LAC", "miami": "MIA", "dolphins": "MIA",
+    "minnesota": "MIN", "vikings": "MIN", "new england": "NE", "patriots": "NE",
+    "new orleans": "NO", "saints": "NO", "new york giants": "NYG", "giants": "NYG",
+    "new york jets": "NYJ", "jets": "NYJ", "philadelphia": "PHI", "eagles": "PHI",
+    "pittsburgh": "PIT", "steelers": "PIT", "san francisco": "SF", "49ers": "SF",
+    "seattle": "SEA", "seahawks": "SEA", "tampa bay": "TB", "buccaneers": "TB",
+    "tennessee": "TEN", "titans": "TEN", "washington": "WAS", "commanders": "WAS"
+}
+
+ROSTER_QB = {}   # {equipo: [nombres de QB activos]}
+SAL_NOM = {}     # {nombre_normalizado: salario en millones}
+
+
+def nfl_qb_roster(nfr, temp):
+    """QB activos por equipo (roster nflverse). Sirve para no elegir QB que ya no están en el equipo."""
+    try:
+        df = nfr.load_rosters(temp).to_pandas()
+        df = df[df.position.astype(str).str.upper().eq("QB")]
+        if "status" in df.columns:
+            df = df[df.status.astype(str).str.upper().eq("ACT")]
+        col = "full_name" if "full_name" in df.columns else "player_name"
+        out = {}
+        for r in df.itertuples():
+            t = NFL_TEAM.get(r.team, r.team)
+            out.setdefault(t, []).append(str(getattr(r, col)))
+        ROSTER_QB.clear()
+        ROSTER_QB.update(out)
+        diag(f"Roster NFL: {sum(map(len, out.values()))} QB activos en {len(out)} equipos")
+    except Exception as e:
+        diag(f"Roster NFL no disponible ({type(e).__name__}: {e})")
+
+
+ESPN_SAL = {}    # {nombre_normalizado: salario en millones} según ESPN (tiene prioridad sobre nflverse)
+
+
+def _buscar_salario(o, prof=0):
+    """Busca recursivamente un salario (>0) en el JSON de ESPN. Devuelve millones de USD o None."""
+    if prof > 6:
+        return None
+    if isinstance(o, dict):
+        for k in ("salary", "baseSalary", "base_salary", "capHit", "cap_hit", "totalCash"):
+            v = num(o.get(k))
+            if v is not None and v > 0:
+                return v / 1e6 if v > 1000 else v
+        for v in o.values():
+            r = _buscar_salario(v, prof + 1)
+            if r:
+                return r
+    elif isinstance(o, list):
+        for v in o:
+            r = _buscar_salario(v, prof + 1)
+            if r:
+                return r
+    return None
+
+
+def _json(url, **prm):
+    r = requests.get(url, params=prm or None, timeout=25)
+    r.raise_for_status()
+    return r.json()
+
+
+def _salario_core(temp, pid):
+    """Respaldo: contrato del jugador en la API 'core' de ESPN."""
+    base = f"https://sports.core.api.espn.com/v2/sports/football/leagues/nfl/seasons/{temp}/athletes/{pid}/contracts"
+    try:
+        d = _json(base, lang="en", region="us")
+        r = _buscar_salario(d)
+        if r:
+            return r
+        for it in d.get("items", []):
+            if isinstance(it, dict) and it.get("$ref"):
+                try:
+                    r = _buscar_salario(_json(it["$ref"].replace("http://", "https://")))
+                    if r:
+                        return r
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    return None
+
+
+def nfl_qb_espn(temp):
+    """PRIORIDAD ESPN: roster de QB por equipo (con su estatus) y salario. Sobrescribe ROSTER_QB y ESPN_SAL.
+    Salario: primero el que venga en el roster de ESPN; si no, el contrato de la API core de ESPN."""
+    try:
+        d = _json("https://site.api.espn.com/apis/site/v2/sports/football/nfl/teams")
+        eqs = [t.get("team", {}) for sp in d.get("sports", []) for lg in sp.get("leagues", []) for t in lg.get("teams", [])]
+    except Exception as e:
+        diag(f"ESPN QB: no se pudo leer la lista de equipos ({e})")
+        return
+
+    def uno(t):
+        try:
+            j = _json(f"https://site.api.espn.com/apis/site/v2/sports/football/nfl/teams/{t['id']}/roster")
+        except Exception:
+            return t, []
+        ath = []
+        for g in j.get("athletes", []):
+            ath += g.get("items", []) if isinstance(g, dict) and "items" in g else [g]
+        out = []
+        for a_ in ath:
+            if not isinstance(a_, dict):
+                continue
+            if str((a_.get("position") or {}).get("abbreviation", "")).upper() != "QB":
+                continue
+            st = a_.get("status") or {}
+            est = str(st.get("name") or st.get("type") or "")
+            out.append(dict(id=a_.get("id"), n=a_.get("fullName") or a_.get("displayName"),
+                            est=est, sal=_buscar_salario(a_.get("contract")) or _buscar_salario(a_)))
+        return t, out
+
+    with ThreadPoolExecutor(8) as ex:
+        res = list(ex.map(uno, [t for t in eqs if t.get("id")]))
+
+    falta = [(t, q) for t, qs in res for q in qs if q["sal"] is None and q["id"]]
+    if falta:
+        with ThreadPoolExecutor(8) as ex:
+            for (t, q), sal in zip(falta, ex.map(lambda tq: _salario_core(temp, tq[1]["id"]), falta)):
+                q["sal"] = sal
+
+    n_eq = n_sal = 0
+    for t, qs in res:
+        ab = NFL_TEAM.get(str(t.get("abbreviation", "")).upper(), str(t.get("abbreviation", "")).upper())
+        qs = [q for q in qs if q["n"] and not es_fuera(q["est"])]
+        if not qs:
+            continue
+        ROSTER_QB[ab] = [q["n"] for q in qs]
+        n_eq += 1
+        for q in qs:
+            if q["sal"]:
+                ESPN_SAL[_nj(q["n"])] = float(q["sal"])
+                n_sal += 1
+    diag(f"ESPN QB: {n_eq} equipos con roster, {n_sal} QB con salario")
+
+
+def nfl_qb_salarios(nfr):
+    """Devuelve {equipo: [{n, salario}]} desde contratos OverTheCap/nflverse.
+    salario está expresado en millones USD por temporada.
+    """
+    try:
+        raw = nfr.load_contracts()
+        df = raw.to_pandas() if hasattr(raw, "to_pandas") else pd.DataFrame(raw)
+        if df.empty:
+            raise RuntimeError("dataset de contratos vacío")
+        df = df[df.position.astype(str).str.upper().eq("QB")].copy()
+        if "is_active" in df:
+            df = df[df.is_active.fillna(False).astype(bool)]
+        def team_code(v):
+            x = _n(str(v)).lower().strip()
+            if x in TEAM_CONTRACT:
+                return TEAM_CONTRACT[x]
+            for k, val in TEAM_CONTRACT.items():
+                if k in x:
+                    return val
+            return None
+        df["team_code"] = df.team.map(team_code)
+        df = df[df.team_code.notna()].copy()
+        season = HOY.year
+        def current_salary(row):
+            hist = row.get("season_history")
+            if isinstance(hist, pd.DataFrame):
+                hist = hist.to_dict("records")
+            if isinstance(hist, str):
+                try: hist = json.loads(hist)
+                except Exception: hist = []
+            if isinstance(hist, (list, tuple)):
+                for item in hist:
+                    if not isinstance(item, dict):
+                        continue
+                    if str(item.get("year", "")).strip() == str(season):
+                        for key in ("base_salary", "cash_paid", "cap_number"):
+                            v = num(item.get(key))
+                            if v is not None and v > 0:
+                                return float(v)
+            v = num(row.get("apy"))
+            return float(v) if v is not None and v > 0 else 0.0
+        df["salario"] = df.apply(current_salary, axis=1)
+        out = {}
+        for _, row in df.iterrows():
+            name = str(row.get("player") or "").strip()
+            salary = float(row.get("salario") or 0)
+            team = row.get("team_code")
+            if name and team and salary > 0:
+                out.setdefault(team, []).append({"n": name, "salario": salary})
+        for team in out:
+            # Un QB puede tener contratos activos anteriores; se conserva el mayor salario reportado.
+            por_nombre = {}
+            for z in out[team]:
+                k = _nj(z["n"])
+                if k not in por_nombre or z["salario"] > por_nombre[k]["salario"]:
+                    por_nombre[k] = z
+            out[team] = sorted(por_nombre.values(), key=lambda z: z["salario"], reverse=True)
+        SAL_NOM.clear()
+        for t_, lst_ in out.items():
+            for z_ in lst_:
+                k_ = _nj(z_["n"])
+                SAL_NOM[k_] = max(SAL_NOM.get(k_, 0.0), z_["salario"])
+        diag(f"Salarios NFL (OverTheCap/nflverse): {sum(map(len, out.values()))} QB cargados")
+        return out
+    except Exception as e:
+        diag(f"Salarios NFL no disponibles ({type(e).__name__}: {e}); se usará uso reciente")
+        return {}
+
+
+def qb_espn_no_disponible(z, rep):
+    """Descarta lesionados según ESPN Fantasy y el reporte ESPN/nflverse del modelo."""
+    st = str(z.get("injury_status") or "").upper()
+    if not z.get("activo", True) or st in ("OUT", "INJURY_RESERVE", "IR", "SUSPENDED", "PUP", "NFI"):
+        return True
+    x = rep.get(_nj(z.get("n", "")), {})
+    return es_fuera(x.get("est", ""))
+
+
 # ───────────────────────── Modelo de QB ─────────────────────────
 def qb_modelo(ps, ref):
     """{equipo: dict(n, s, delta, bk, q_s, q_b)} — valor del QB titular vs. su suplente, en puntos por partido.
@@ -514,14 +742,14 @@ def qb_modelo(ps, ref):
                 q_b, bn = mu_rep, "suplente no identificado"
             delta = float(np.clip((q_s - q_b) * QB_DB_JUEGO * QB_ESCALA, 0.5, QB_MAX_PTS))
             Q[t] = dict(n=nombre, s=min(1.0, s), delta=delta, bk=bn, q_s=q_s, q_b=q_b,
-                        q_alts=q_alts)
+                        q_alts=q_alts, mu_rep=float(mu_rep))
         return Q
     except Exception as e:
         diag(f"QB: modelo falló ({type(e).__name__}: {e})")
         return {}
 
 
-def escenario_qb(Q, team, inj, M, ref):
+def escenario_qb(Q, team, inj, M, ref, salarios_qb=None):
     """Estado del QB titular y su ajuste en PUNTOS del equipo en cada escenario.
     estado: ok (sano) | duda (Questionable/Doubtful/Day-To-Day) | fuera (Out/IR/...).
     juega / fuera: puntos que se suman (+) o restan (-) al equipo en cada caso."""
@@ -537,20 +765,47 @@ def escenario_qb(Q, team, inj, M, ref):
     est = x["est"] if x else ""
     estado = "ok" if not x else ("fuera" if es_fuera(est) else "duda")
 
-    # Si el QB identificado está fuera, busca al siguiente QB con uso reciente
-    # que NO esté marcado OUT/IR. No usa automáticamente el suplente histórico.
+    # Si el QB identificado está fuera, busca al reemplazo entre los QB ACTIVOS del roster,
+    # excluyendo a cualquiera que aparezca en el reporte de lesiones, y elige el de mayor salario.
     bk = q.get("bk", "suplente no identificado")
     q_s = float(q.get("q_s", 0.0))
     q_b = float(q.get("q_b", 0.0))
     if estado == "fuera":
+        # Candidatos = QB activos del roster (más los de contratos), SIN ninguno que aparezca en el reporte de lesiones.
+        pool = {}
+        for z in (salarios_qb or {}).get(team, []):
+            pool[_nj(z["n"])] = [z["n"], float(z["salario"])]
+        for n_ in ROSTER_QB.get(team, []):
+            k_ = _nj(n_)
+            pool.setdefault(k_, [n_, 0.0])
+            pool[k_][1] = max(pool[k_][1], SAL_NOM.get(k_, 0.0))
+        roster = {_nj(n_) for n_ in ROSTER_QB.get(team, [])}
+        if roster:
+            pool = {k: v for k, v in pool.items() if k in roster}
+        for k_, v_ in pool.items():                       # ESPN manda sobre nflverse
+            if k_ in ESPN_SAL:
+                v_[1] = ESPN_SAL[k_]
+        disp = sorted(((k, v) for k, v in pool.items()
+                       if k != _nj(q["n"]) and k not in rep and v[1] > 0),
+                      key=lambda kv: -kv[1][1])
         candidatos = q.get("q_alts", [])
-        elegido = next((z for z in candidatos
-                        if not es_fuera(rep.get(_nj(z["n"]), {}).get("est", ""))), None)
-        if elegido:
-            bk = elegido["n"]
-            q_b = float(elegido["q"])
+        diag(f"QB {team} pool de reemplazo (roster={len(roster)} QB): " + "; ".join(
+            f"{v[0]} ${v[1]:.1f}M" + (" [en reporte de lesiones]" if k in rep else "")
+            + (" [titular]" if k == _nj(q["n"]) else "") for k, v in pool.items()) )
+        if disp:
+            bk, sal = disp[0][1]
+            coincide = next((z for z in candidatos if _nj(z["n"]) == _nj(bk)), None)
+            q_b = float(coincide["q"]) if coincide else float(q.get("mu_rep", q_b))
+            diag(f"QB {team}: reemplazo por salario NFL → {bk} (${sal:.2f}M/año)")
         else:
-            bk = "QB disponible no identificado"
+            # Respaldo: uso reciente, excluyendo a cualquiera que esté en el reporte de lesiones.
+            elegido = next((z for z in candidatos if _nj(z["n"]) not in rep), None)
+            if elegido:
+                bk = elegido["n"]
+                q_b = float(elegido["q"])
+            else:
+                bk = "QB disponible no identificado"
+                q_b = float(q.get("mu_rep", q_b))
         # Recalcula la diferencia con el reemplazo elegido.
         dl = float(np.clip((q_s - q_b) * QB_DB_JUEGO * QB_ESCALA, 0.5, QB_MAX_PTS))
     else:
@@ -648,6 +903,17 @@ def filas_nfl(h, a, mar, tot, sp_line, tot_line, M, ref, R=None, bad=None, duda=
     return rows
 
 
+def hora_nfl_gdl(fecha, hora):
+    """Convierte kickoff de NFL (hora del Este) a hora del centro de México."""
+    try:
+        if not hora or pd.isna(hora):
+            return ""
+        base = pd.Timestamp(f"{pd.Timestamp(fecha).date()} {str(hora).strip()}")
+        return base.tz_localize("America/New_York").tz_convert("America/Mexico_City").strftime("%H:%M")
+    except Exception:
+        return ""
+
+
 def nfl():
     import nflreadpy as nfr
     temp = HOY.year if HOY.month >= 3 else HOY.year - 1
@@ -704,6 +970,11 @@ def nfl():
         except Exception as e:
             diag(f"NFL lesiones falló: {e}")
     Q = qb_modelo(ps, ref_hoy)
+    SALARIOS_QB = nfl_qb_salarios(nfr) if len(prox) else {}
+    if len(prox):
+        nfl_qb_roster(nfr, temp)
+    if len(prox):
+        nfl_qb_espn(temp)                                      # ESPN pisa roster y salarios de nflverse
     if Q:
         top = sorted(Q.items(), key=lambda kv: -kv[1]["delta"])[:5]
         diag("QB · valor vs suplente (pts/juego), top 5: " + ", ".join(f"{t} {q['n']} {q['delta']:.1f}" for t, q in top))
@@ -716,8 +987,8 @@ def nfl():
         bad, duda = partir_lesiones(inj)
 
         mar0, tot0 = pred_nfl(M_hoy, h, a)                     # modelo base (sin ajuste de QB)
-        sh = escenario_qb(Q, h, inj, M_hoy, ref_hoy)
-        sa = escenario_qb(Q, a, inj, M_hoy, ref_hoy)
+        sh = escenario_qb(Q, h, inj, M_hoy, ref_hoy, SALARIOS_QB)
+        sa = escenario_qb(Q, a, inj, M_hoy, ref_hoy, SALARIOS_QB)
         ah, aa = ajuste_base(sh), ajuste_base(sa)
         mar, tot = aplicar_qb(mar0, tot0, ah, aa)              # modelo normal (QB dudoso = juega)
         alt = alternativas_qb(h, a, sh, sa, mar0, tot0, r.spread_line, r.total_line)
@@ -729,7 +1000,7 @@ def nfl():
         probs = [dict(l=h, p=float(ph), c=ml_dec(getattr(r, "home_moneyline", None))),
                  dict(l=a, p=float(1 - ph), c=ml_dec(getattr(r, "away_moneyline", None)))]
         les = dict(h=bajas_clave(M_hoy, h, ref_hoy, inj), a=bajas_clave(M_hoy, a, ref_hoy, inj)) if inj else None
-        out.append(dict(sp="NFL", lg="NFL", date=str(r.gameday.date()), home=h, away=a,
+        out.append(dict(sp="NFL", lg="NFL", date=str(r.gameday.date()), hora=hora_nfl_gdl(r.gameday, getattr(r, "gametime", "")), home=h, away=a,
                         week=int(r.week), div=es_div(r, h, a),
                         logo_h=logo(h, "NFL"), logo_a=logo(a, "NFL"),
                         proy=[round((tot + mar) / 2, 1), round((tot - mar) / 2, 1)],
@@ -991,7 +1262,8 @@ def _espn_ventana(slug, d1, d2):
             for T in (H, Av):
                 if T["team"].get("logo"):
                     LOGOS.setdefault(_n(T["team"]["displayName"]), T["team"]["logo"])
-            out.append(dict(Date=pd.to_datetime(e["date"], utc=True).tz_convert(None),
+            out.append(dict(Date=pd.to_datetime(e["date"], utc=True).tz_convert("America/Mexico_City").tz_localize(None),
+                            Hora=pd.to_datetime(e["date"], utc=True).tz_convert("America/Mexico_City").strftime("%H:%M"),
                             h=H["team"]["displayName"], a=Av["team"]["displayName"],
                             FTHG=num(H.get("score")), FTAG=num(Av.get("score")),
                             HC=stat_espn(H, ("wonCorners",)), AC=stat_espn(Av, ("wonCorners",)),
@@ -1070,7 +1342,7 @@ def espn_prox(slug, nombres=None, act=None):
                     if (h2, a2) in vistos:
                         continue
                     vistos.add((h2, a2))
-                    res.append(dict(h=h2, a=a2, Date=r.Date, cu=list(r.cu), src="ESPN"))
+                    res.append(dict(h=h2, a=a2, Date=r.Date, Hora=getattr(r, "Hora", ""), cu=list(r.cu), src="ESPN"))
         except Exception as e:
             diag(f"ESPN {slug} {d:%Y-%m-%d}→{e2:%Y-%m-%d}: {e}")
         d = e2 + dt.timedelta(days=1)
@@ -1100,7 +1372,9 @@ def fd_org(liga, nombres=None, act=None):
             if not ht.get("name") or not at.get("name"):      # llaves por definir (eliminatorias)
                 continue
             n1, n2 = ht.get("shortName") or ht["name"], at.get("shortName") or at["name"]
-            f = pd.to_datetime(m["utcDate"], utc=True).tz_convert(None)
+            f_utc = pd.to_datetime(m["utcDate"], utc=True)
+            f_local = f_utc.tz_convert("America/Mexico_City")
+            f = f_local.tz_localize(None)
             if f < TS(HOY):
                 continue
             strict = bool(act and nombres)
@@ -1111,7 +1385,7 @@ def fd_org(liga, nombres=None, act=None):
             for T, nm in ((ht, h2), (at, a2)):
                 if T.get("crest"):
                     LOGOS.setdefault(_n(nm), T["crest"])
-            res.append(dict(h=h2, a=a2, Date=f, cu=[None] * 3, src="football-data.org"))
+            res.append(dict(h=h2, a=a2, Date=f, Hora=f_local.strftime("%H:%M"), cu=[None] * 3, src="football-data.org"))
         res = sorted(res, key=lambda x: x["Date"])[:N_PROX]
         diag(f"{liga}: football-data.org devolvió {len(res)} próximos")
         return res
@@ -1355,7 +1629,7 @@ def futbol():
                         cu = odds.get((h, a)) or odds_esp.get((h, a)) or cu
                     con_cuota += 1 if all(cu) else 0
                     probs = [dict(l=l, p=float(pp), c=c) for l, pp, c in zip((h, "Empate", a), (p1, px, p2), cu)]
-                    out.append(dict(sp="FUT", lg=liga, date=str(p["Date"].date()), home=h, away=a,
+                    out.append(dict(sp="FUT", lg=liga, date=str(p["Date"].date()), hora=p.get("Hora", ""), home=h, away=a,
                                     logo_h=logo(h, "FUT"), logo_a=logo(a, "FUT"),
                                     proy=[round(lh, 1), round(la, 1)], rows=rows, probs=probs, ia="",
                                     racha=dict(h=racha_equipo(gl, h, ref_hoy), a=racha_equipo(gl, a, ref_hoy)),
@@ -1396,7 +1670,7 @@ HTML_PART1 = r"""<!doctype html><html lang="es"><head><meta charset="utf-8">
 *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
 html{-webkit-text-size-adjust:100%;text-size-adjust:100%}
 body{margin:0;overflow-x:hidden;min-height:100vh;background:radial-gradient(1200px 500px at 50% -100px,#2a0f26 0,transparent 70%),var(--bg);background-attachment:fixed;color:var(--tx);font-family:Barlow,-apple-system,sans-serif;padding-bottom:env(safe-area-inset-bottom)}
-header.top{position:sticky;top:0;z-index:50;background:rgba(9,9,18,.88);-webkit-backdrop-filter:blur(14px);backdrop-filter:blur(14px);padding-top:env(safe-area-inset-top)}
+header.top{display:block;position:sticky;top:0;z-index:50;background:rgba(9,9,18,.88);-webkit-backdrop-filter:blur(14px);backdrop-filter:blur(14px);padding-top:env(safe-area-inset-top)}
 /* ticker */
 .tick{overflow:hidden;border-bottom:1px solid #1d1530;background:#0c0c1e;height:34px;display:flex;align-items:center}
 .tick .lbl{flex:none;background:var(--red);color:#fff;font:800 12px 'Barlow Condensed';letter-spacing:.16em;padding:0 12px;height:100%;display:flex;align-items:center;z-index:2}
@@ -1412,7 +1686,7 @@ nav{display:flex;flex-wrap:wrap;align-items:center;gap:6px 30px;padding:12px 40p
 nav::-webkit-scrollbar{display:none}
 .logo{order:1;font-size:26px;line-height:1.25;letter-spacing:.06em;cursor:pointer;flex:none;white-space:nowrap}.logo i{color:var(--red);font-style:normal}
 nav a{cursor:pointer;color:var(--mut);font-size:15px;padding:8px 0;transition:.2s;flex:none}nav a.on{color:var(--red);border-bottom:2px solid var(--red)}
-.fmt{order:2;margin-left:auto;flex:none;background:transparent;border:1px solid var(--red);color:var(--red);border-radius:20px;padding:8px 16px;cursor:pointer;font:700 13px 'Barlow Condensed';letter-spacing:.14em;text-transform:uppercase;-webkit-appearance:none}
+.fmt{order:3;margin-left:auto;flex:none;background:transparent;border:1px solid var(--red);color:var(--red);border-radius:20px;padding:8px 16px;cursor:pointer;font:700 13px 'Barlow Condensed';letter-spacing:.14em;text-transform:uppercase;-webkit-appearance:none}
 .fmt:hover{background:var(--red);color:#fff}
 main{padding:30px 40px;max-width:1500px;margin:0 auto}
 h1{font:800 56px 'Barlow Condensed';margin:0;text-transform:uppercase;line-height:1}h1 span,h1 i{color:var(--red);font-style:italic}
@@ -1495,7 +1769,7 @@ input{width:62px;background:#0c0c1e;border:1px solid var(--line);border-radius:6
 .pk .cf{font:800 12px 'Barlow Condensed';letter-spacing:.12em;border-radius:12px;padding:2px 10px;white-space:nowrap;background:#555570}
 .pk .cf.alta{background:var(--ok)}.pk .cf.media{background:#b8861b}
 .pk small{color:var(--mut);display:block}.pk b{color:#fff}
-.tabs{order:3;width:100%;display:flex;gap:30px;flex:none;overflow-x:auto;-webkit-overflow-scrolling:touch;scrollbar-width:none}.tabs::-webkit-scrollbar{display:none}.tw{overflow-x:auto;-webkit-overflow-scrolling:touch}.tw table{margin-top:12px}
+.tabs{order:2;width:auto;display:flex;gap:30px;flex:none;overflow-x:auto;-webkit-overflow-scrolling:touch;scrollbar-width:none}.tabs::-webkit-scrollbar{display:none}.tw{overflow-x:auto;-webkit-overflow-scrolling:touch}.tw table{margin-top:12px}
 td{overflow-wrap:break-word}td:nth-child(2),td:nth-child(3){white-space:nowrap}td:nth-child(4){min-width:112px}
 .tag{background:#2a1b3a;color:#e9d5ff;border-radius:8px;padding:1px 8px;margin-left:6px;font-size:11px}
 .diag{color:var(--mut);font-size:12px;line-height:1.6;margin-top:10px;white-space:pre-wrap}
@@ -1504,11 +1778,12 @@ td{overflow-wrap:break-word}td:nth-child(2),td:nth-child(3){white-space:nowrap}t
 .alt{margin-top:16px;border:1px dashed #6b2a5a;border-radius:10px;padding:10px 12px;background:#0e0e24}
 .alt h4{margin:0 0 6px;font:800 13px 'Barlow Condensed';letter-spacing:.14em;color:#f5b301}
 .nota{color:var(--mut);font-size:12px;margin-top:26px}
+.updated{padding:7px 22px 9px;text-align:right;color:var(--mut);font:600 10px 'Barlow Condensed';letter-spacing:.12em}
 @media(pointer:coarse){input,.eo input{font-size:16px}}   /* evita el zoom automático de Safari al escribir */
 @media(max-width:640px){
  main{padding:20px 16px calc(24px + env(safe-area-inset-bottom))}nav{padding:10px 16px;gap:20px}h1{font-size:40px}
  .card{padding:18px 16px}.sc{font-size:34px}.eq b{font-size:15px}.ci{width:52px;height:52px}
- nav{flex-wrap:wrap;overflow:visible;row-gap:6px}.logo{order:1;font-size:22px}.fmt{order:2;padding:6px 12px}
+ nav{flex-wrap:wrap;overflow:visible;row-gap:6px}.logo{order:1;font-size:22px}.fmt{order:2;margin-left:auto;padding:6px 12px}.tabs{order:3;width:100%;}
  .tabs{order:3;width:100%;gap:22px;overflow-x:auto;-webkit-overflow-scrolling:touch;scrollbar-width:none}.tabs::-webkit-scrollbar{display:none}
  .eo{grid-template-columns:minmax(0,1fr) auto 58px;gap:6px}.eo .fj{grid-column:1/-1;order:3;white-space:normal}.eo input{width:70px}
  table{font-size:12px}td{padding:6px 3px}.g{font-size:11px}.tw input{width:54px}
@@ -1526,10 +1801,12 @@ td{overflow-wrap:break-word}td:nth-child(2),td:nth-child(3){white-space:nowrap}t
 <a id="tCL" onclick="setTab('CL')">CHAMPIONS</a>
 <a id="tRES" onclick="setTab('RES')">RESULTADOS</a></div>
 <button class="fmt" id="fmtbtn" onclick="toggleFmt()"></button>
-</nav></header>
+</nav>
+<div class="updated">ÚLTIMA ACTUALIZACIÓN: __ACTUALIZADO__ · HORA DE GUADALAJARA</div>
+</header>
 <main><h1 id="ttl"></h1><div id="descr" class="sub"></div>
 <div id="home" class="lobby"></div>
-<div id="ai"></div><div id="picks"></div><div class="chips" id="chips"></div><div class="grid" id="grid"></div><div class="nota">Modelo estadístico (Ridge / Poisson / Normal). Edge = probabilidad del modelo × cuota decimal − 1 (el momio de la casa ya incluye su margen). Puedes escribir tu momio en americano (+150, -110) o decimal (2.50): se detecta solo; con el botón ± cambias el signo. 🏠 = equipo local. Racha = últimos 5 juegos (G ganó · E empató · P perdió). Estrellas 1-5 = ranking de todos los equipos de la liga con sus últimos 5 juegos: puntos/goles a favor (ofensiva) y en contra (defensiva), ajustados por la calidad del rival; 5 = el 20 % mejor. Bajas = reporte de lesiones de ESPN/nflverse (gana el reporte más reciente); los jugadores que no jugarán (Out, IR, PUP, suspendidos) se excluyen de las apuestas; los dudables (Questionable, Doubtful, Day-To-Day) aparecen marcados con DUDA: su fila normal va arriba y la del suplente (si no juega) hasta abajo. Ajuste de QB: el valor del mariscal titular sobre su suplente se mide con EPA por jugada; si está fuera el modelo ya resta esos puntos, y si está dudoso la tabla asume que juega y abajo aparece el escenario "si no juega". Cifras redondeadas, salvo proyecciones, spread y total. Los picks de Gemini combinan tu modelo con noticias de la web y pueden fallar. Solo informativo, no es asesoría financiera. En Resultados se visualizan exclusivamente filas con datos reales.</div></main>"""
+<div id="ai"></div><div id="picks"></div><div class="chips" id="chips"></div><div class="grid" id="grid"></div><div class="nota">Modelo estadístico (Ridge / Poisson / Normal). Edge = probabilidad del modelo × cuota decimal − 1 (el momio de la casa ya incluye su margen). Puedes escribir tu momio en americano (+150, -110) o decimal (2.50): se detecta solo; con el botón ± cambias el signo. 🏠 = equipo local. Racha = últimos 5 juegos (G ganó · E empató · P perdió). Estrellas 1-5 = ranking de todos los equipos de la liga con sus últimos 5 juegos: puntos/goles a favor (ofensiva) y en contra (defensiva), ajustados por la calidad del rival; 5 = el 20 % mejor. Bajas = reporte de lesiones de ESPN/nflverse (gana el reporte más reciente); los jugadores que no jugarán (Out, IR, PUP, suspendidos) se excluyen de las apuestas; los dudables (Questionable, Doubtful, Day-To-Day) aparecen marcados con DUDA: su fila normal va arriba y la del suplente (si no juega) hasta abajo. Ajuste de QB: el valor del mariscal titular sobre su suplente se mide con EPA por jugada; si está fuera, el reemplazo se elige por mayor salario base NFL de la temporada actual (datos de contratos OverTheCap vía nflverse) entre los QB activos del roster que no aparezcan en el reporte de lesiones; si no hay salario utilizable, se usa el uso reciente. El salario se expresa en millones de dólares por año. El modelo ya resta esos puntos, y si está dudoso la tabla asume que juega y abajo aparece el escenario "si no juega". Cifras redondeadas, salvo proyecciones, spread y total. Los picks de Gemini combinan tu modelo con noticias de la web y pueden fallar. Solo informativo, no es asesoría financiera. En Resultados se visualizan exclusivamente filas con datos reales.</div></main>"""
 
 HTML_PART2_JS = r"""<script>
 const D = __DATA__;
@@ -1693,7 +1970,7 @@ function card(g, hist) {
 
   return `<div class="card">
     <div class="top"><span class="lg">${g.lg}</span><span>${valB}${badge}</span></div>
-    <div class="fecha">${g.date}${g.week ? ` · SEMANA ${g.week}` : ''}${g.div ? '<span class="tag">DIVISIONAL</span>' : ''}</div>
+    <div class="fecha">${g.date}${g.hora ? ` · ${g.hora} H CENTRO` : ''}${g.week ? ` · SEMANA ${g.week}` : ''}${g.div ? '<span class="tag">DIVISIONAL</span>' : ''}</div>
     <div class="vs">${team(g.home, g.logo_h, true, g.racha && g.racha.h, g.les ? g.les.h : null)}${mid}${team(g.away, g.logo_a, false, g.racha && g.racha.a, g.les ? g.les.a : null)}</div>
     ${pr}
     ${qbH}
@@ -1832,7 +2109,8 @@ def main():
         for g in lst:
             g["ia"] = aj.get(f"{g['home']}-{g['away']}", {}).get("notas", "")
     data = dict(nfl=nfl_p, nflhist=nfl_h, fut=fut_p, futhist=fut_h, ai=resumen, picks=picks, diag=DIAG)
-    html = HTML_PART1 + HTML_PART2_JS.replace("__DATA__", json.dumps(data, ensure_ascii=False, default=str))
+    hora_gdl = dt.datetime.now(ZoneInfo("America/Mexico_City")).strftime("%d/%m/%Y · %H:%M")
+    html = HTML_PART1.replace("__ACTUALIZADO__", hora_gdl) + HTML_PART2_JS.replace("__DATA__", json.dumps(data, ensure_ascii=False, default=str))
     with open(SALIDA, "w", encoding="utf-8") as f:
         f.write(html)
     print("Listo →", SALIDA)
