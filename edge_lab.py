@@ -38,6 +38,7 @@ QB_ESCALA = 1.0           # perilla global: 0.8 = penalizaciones 20 % más chica
 QB_MAX_PTS = 10.0         # tope de puntos que vale un QB sobre su suplente
 QB_BONO_MAX = 2.0         # tope del ajuste positivo cuando el titular SÍ juega
 QB_CORREGIR_JUEGA = False # modo QB_OUT_ONLY: si el titular está activo, se conserva el Ridge normal
+QB_RATING = {}   # {nombre_normalizado: rating EPA/dropback} de TODOS los QB con historial, sin importar el equipo
 QB_PEN_DEF = 3.5          # penalización fija si no hay datos de EPA
 QB_YDS_K = 0.8            # cuánto se mueven las yardas aéreas del equipo por cada punto de ajuste de QB
 PTS_EQUIPO = 22.0         # puntos promedio por equipo (para escalar yardas)
@@ -203,6 +204,7 @@ POS = {"QB": ("passing_yards", "attempts", 10),
        "RB": ("rushing_yards", "carries", 8),
        "WR": ("receiving_yards", "targets", 4)}
 SD_DEF = {"QB": 70.0, "RB": 30.0, "WR": 30.0}
+MIN_VOL = {"QB": 15, "RB": 6, "WR": 3}   # un juego solo cuenta para la proyección si tuvo al menos N intentos / acarreos / targets
 SD_MARGEN = 13.5
 
 DIVS = {"AFC Este": "BUF MIA NE NYJ", "AFC Norte": "BAL CIN CLE PIT", "AFC Sur": "HOU IND JAX TEN",
@@ -378,7 +380,8 @@ def modelo_nfl(jug, wide, ps, ref, eq, ix):
             M["gr"] = tasas(wc, "gr_h", "gr_a", k=3, ref=ref, hl=150)
             M["sd_air"] = float(pd.concat([wc.air_h, wc.air_a]).std())
             M["sd_gr"] = float(pd.concat([wc.gr_h, wc.gr_a]).std())
-            pc = ps[ps.Date < ref]
+            pc = ps[ps.Date < ref].copy()
+            pc["nj"] = pc.player_display_name.map(_nj)          # nombre normalizado para cruzar con el depth chart
             M["ps"] = pc
             sdp = {}
             for pos, (y, v, thr) in POS.items():
@@ -418,40 +421,167 @@ def ranking(M, team, pos, ref, activo=True):
     return list(g.index)
 
 
-def jugador(M, team, pos, ref, dfn_opp, bad=frozenset(), activo=True):
-    """Titular de la posición que se usará para la apuesta: el de más volumen que jugó el último partido
-    y que NO figura en el reporte de lesiones (bad = nombres normalizados no disponibles)."""
+# ── Depth chart de ESPN (QB / RB / WR) ──
+DEPTH = {}   # {equipo: {"QB": [nombres en orden], "RB": [...], "WR": [...]}}
+
+
+def _atleta(a_):
+    """(nombre, id) de un atleta del depth chart; ESPN a veces solo manda el id o un $ref."""
+    ath = a_.get("athlete") if isinstance(a_.get("athlete"), dict) else a_
+    nombre = ath.get("displayName") or ath.get("fullName") or a_.get("displayName") or a_.get("fullName")
+    pid = ath.get("id") or a_.get("id")
+    if not pid:
+        ref = ath.get("$ref") or a_.get("$ref") or ""
+        m = re.search(r"athletes/(\d+)", str(ref))
+        pid = m.group(1) if m else None
+    return nombre, (str(pid) if pid else None)
+
+
+def _parse_depth(j):
+    """Recorre el JSON del depth chart y junta [(nombre, id)] de QB/RB/WR en el orden de ESPN (qb, rb, wr1, wr2...)."""
+    out = {"QB": [], "RB": [], "WR": []}
+
+    def walk(o):
+        if isinstance(o, dict):
+            pos = o.get("positions")
+            if isinstance(pos, dict):
+                for k, v in sorted(pos.items(), key=lambda kv: str(kv[0])):
+                    p = str(k).upper().rstrip("0123456789")
+                    if p in out and isinstance(v, dict):
+                        for a_ in v.get("athletes", []) or []:
+                            if not isinstance(a_, dict):
+                                continue
+                            n, i = _atleta(a_)
+                            if (n or i) and not any((n and n == x[0]) or (i and i == x[1]) for x in out[p]):
+                                out[p].append((n, i))
+            for v in o.values():
+                walk(v)
+        elif isinstance(o, list):
+            for v in o:
+                walk(v)
+
+    walk(j)
+    return out
+
+
+def _roster_ids(tid):
+    """{id: nombre} de todo el roster de ESPN del equipo (para resolver atletas que vienen solo con id)."""
+    try:
+        j = _json(f"https://site.api.espn.com/apis/site/v2/sports/football/nfl/teams/{tid}/roster")
+    except Exception:
+        return {}
+    ath = []
+    for g in j.get("athletes", []):
+        ath += g.get("items", []) if isinstance(g, dict) and "items" in g else [g]
+    return {str(a_.get("id")): (a_.get("fullName") or a_.get("displayName"))
+            for a_ in ath if isinstance(a_, dict) and a_.get("id")}
+
+
+def nfl_depth():
+    """Depth chart oficial de ESPN por equipo. Llena DEPTH con nombres, en el orden de ESPN."""
+    try:
+        d = _json("https://site.api.espn.com/apis/site/v2/sports/football/nfl/teams")
+        eqs = [t.get("team", {}) for sp in d.get("sports", []) for lg in sp.get("leagues", []) for t in lg.get("teams", [])]
+    except Exception as e:
+        diag(f"Depth chart: no se pudo leer la lista de equipos ({e})")
+        return
+
+    def uno(t):
+        try:
+            j = _json(f"https://site.api.espn.com/apis/site/v2/sports/football/nfl/teams/{t['id']}/depthcharts")
+            dc = _parse_depth(j)
+        except Exception:
+            return t, None
+        if any(n is None for lst in dc.values() for n, _ in lst):      # faltan nombres: se resuelven por id
+            ids = _roster_ids(t["id"])
+            dc = {p: [(n or ids.get(i), i) for n, i in lst] for p, lst in dc.items()}
+        return t, {p: [n for n, _ in lst if n] for p, lst in dc.items()}
+
+    with ThreadPoolExecutor(8) as ex:
+        res = list(ex.map(uno, [t for t in eqs if t.get("id")]))
+    DEPTH.clear()
+    for t, dc in res:
+        ab = str(t.get("abbreviation", "")).upper()
+        ab = NFL_TEAM.get(ab, ab)
+        if dc and any(dc.values()):
+            DEPTH[ab] = dc
+    diag(f"Depth chart ESPN: {len(DEPTH)} equipos"
+         + ("" if DEPTH else " (vacío: se usa el volumen reciente como respaldo)"))
+
+
+def _proy_jugador(d, pid, nombre, ycol, pos, M, dfn_opp):
+    h = d[d.player_id == pid]
+    hv = h[h[POS[pos][1]] >= MIN_VOL[pos]]        # descarta entradas de relevo / garbage time
+    if len(hv):
+        h = hv
+    h = h.sort_values("Date", ascending=False).head(8)
+    n = len(h)
+    if n == 0:
+        return None
+    w = 0.7 ** np.arange(n)
+    mu = float(np.average(h[ycol], weights=w)) * dfn_opp
+    var_j = float(h[ycol].var(ddof=0)) if n > 1 else 0.0
+    sd = math.sqrt((n * var_j + 4 * M["sd_pos"][pos] ** 2) / (n + 4))
+    return pid, nombre, mu, max(sd, 10.0)
+
+
+def jugador(M, team, pos, ref, dfn_opp, bad=frozenset(), activo=True, depth=True):
+    """Titular de la posición que se usará para la apuesta. Primero el depth chart de ESPN (en orden,
+    saltando a quien esté en `bad`); si ESPN no lo trae o nadie tiene estadísticas, usa el volumen reciente.
+    depth=False (resultados pasados): no se usa el depth chart actual, solo el volumen de esa fecha."""
     ycol = POS[pos][0]
     d = M["ps"]
     d = d[d.position == pos]
-    for pid, nombre in ranking(M, team, pos, ref, activo=activo):
+    if depth and DEPTH.get(team, {}).get(pos):
+        y, v, thr = POS[pos]
+        for nombre in DEPTH[team][pos]:
+            k = _nj(nombre)
+            if k in bad:
+                continue
+            sub = d[(d.team == team) & (d.nj == k)]
+            if sub.empty:
+                sub = d[d.nj == k]                    # estadísticas con otro equipo (fichaje reciente)
+            r = None
+            if not sub.empty:
+                sub = sub.sort_values("Date")
+                r = _proy_jugador(d, sub.player_id.iloc[-1], sub.player_display_name.iloc[-1], y, pos, M, dfn_opp)
+            if not r:
+                # sin historial (novato / de práctica): se respeta el depth chart con un promedio de la posición
+                base = d.loc[d[v] >= thr, y]
+                mu = float(base.median()) * dfn_opp if len(base) else 0.0
+                r = (None, nombre, mu, max(M["sd_pos"][pos], 10.0))
+            return r
+        # todos los del depth chart están fuera: cae al respaldo
+    for pid, nombre in ranking(M, team, pos, ref, activo=activo):      # respaldo
         if _nj(nombre) in bad:
             continue
-        h = d[d.player_id == pid].sort_values("Date", ascending=False).head(8)
-        n = len(h)
-        w = 0.7 ** np.arange(n)
-        mu = float(np.average(h[ycol], weights=w)) * dfn_opp
-        var_j = float(h[ycol].var(ddof=0)) if n > 1 else 0.0
-        sd = math.sqrt((n * var_j + 4 * M["sd_pos"][pos] ** 2) / (n + 4))
-        return pid, nombre, mu, max(sd, 10.0)
+        r = _proy_jugador(d, pid, nombre, ycol, pos, M, dfn_opp)
+        if r:
+            return r
     return None
 
 
+def titulares(M, team, pos, ref, k):
+    """Los k primeros del depth chart (o del ranking por volumen si ESPN no trae datos)."""
+    dep = DEPTH.get(team, {}).get(pos, [])[:k]
+    return dep if dep else [n for _, n in ranking(M, team, pos, ref, activo=False)[:k]]
+
+
 def bajas_clave(M, team, ref, inj):
-    """Jugadores principales (QB1, RB1, WR1 y WR2 por volumen reciente) que están en el reporte de lesiones."""
+    """QB1, RB1, WR1 y WR2 según el depth chart de ESPN que estén en el reporte de lesiones."""
     if "ps" not in M:
         return []
     rep = inj.get(team, {})
     out = []
     for pos, k in (("QB", 1), ("RB", 1), ("WR", 2)):
-        for pid, nombre in ranking(M, team, pos, ref, activo=False)[:k]:
+        for nombre in titulares(M, team, pos, ref, k):
             x = rep.get(_nj(nombre))
             if x:
                 out.append(dict(n=nombre, pos=pos, est=x["est"]))
     return out
 
 
-# ── Salario NFL (OverTheCap vía nflverse) para elegir QB reemplazo ──
+# ── Salario NFL (OverTheCap vía nflverse) para elegir QB reemplazo (respaldo si no hay depth chart) ──
 # Se usa el salario base de la temporada actual (millones USD); si no existe,
 # se utiliza APY como respaldo. No es salario fantasy ni valor de subasta.
 TEAM_CONTRACT = {
@@ -713,6 +843,11 @@ def qb_modelo(ps, ref):
             x = pj.loc[pid]
             return float((x.wepa + QB_PRIOR_DB * mu) / (x.wdb + QB_PRIOR_DB))
 
+        nom_ = d.drop_duplicates("player_id").set_index("player_id").player_display_name
+        QB_RATING.clear()
+        for pid_ in pj.index:
+            QB_RATING[_nj(nom_[pid_])] = rating(pid_, mu_rep)      # prior de suplente: conservador con quien casi no ha jugado
+
         Q = {}
         for t, g in d.groupby("team"):
             rec = g[g.Date >= ref - dt.timedelta(days=42)]
@@ -752,7 +887,9 @@ def qb_modelo(ps, ref):
 def escenario_qb(Q, team, inj, M, ref, salarios_qb=None):
     """Estado del QB titular y su ajuste en PUNTOS del equipo en cada escenario.
     estado: ok (sano) | duda (Questionable/Doubtful/Day-To-Day) | fuera (Out/IR/...).
-    juega / fuera: puntos que se suman (+) o restan (-) al equipo en cada caso."""
+    juega / fuera: puntos que se suman (+) o restan (-) al equipo en cada caso.
+    El reemplazo es el siguiente QB del depth chart de ESPN que no esté en el reporte de lesiones;
+    si ESPN no lo trae, se usa salario / uso reciente."""
     q = Q.get(team)
     if not q and "ps" in M:                                   # respaldo: sin EPA, penalización fija
         rk = ranking(M, team, "QB", ref, activo=False)
@@ -765,12 +902,31 @@ def escenario_qb(Q, team, inj, M, ref, salarios_qb=None):
     est = x["est"] if x else ""
     estado = "ok" if not x else ("fuera" if es_fuera(est) else "duda")
 
-    # Si el QB identificado está fuera, busca al reemplazo entre los QB ACTIVOS del roster,
-    # excluyendo a cualquiera que aparezca en el reporte de lesiones, y elige el de mayor salario.
     bk = q.get("bk", "suplente no identificado")
     q_s = float(q.get("q_s", 0.0))
     q_b = float(q.get("q_b", 0.0))
-    if estado == "fuera":
+    dl = float(q["delta"])
+
+    # 1) PRIORIDAD: siguiente QB del depth chart de ESPN que no esté en el reporte de lesiones
+    dep = []
+    if estado != "ok":
+        dep = [n_ for n_ in DEPTH.get(team, {}).get("QB", [])
+               if _nj(n_) != _nj(q["n"]) and _nj(n_) not in rep]
+    if dep:
+        bk = dep[0]
+        coincide = next((z for z in q.get("q_alts", []) if _nj(z["n"]) == _nj(bk)), None)
+        if coincide:
+            q_b = float(coincide["q"])
+        elif _nj(bk) in QB_RATING:                        # llegó de otro equipo: se usa su EPA de allá
+            q_b = float(QB_RATING[_nj(bk)])
+        else:
+            q_b = float(q.get("mu_rep", q_b))
+        dl = float(np.clip((q_s - q_b) * QB_DB_JUEGO * QB_ESCALA, 0.5, QB_MAX_PTS))
+        diag(f"QB {team}: reemplazo por depth chart ESPN → {bk} (EPA/dropback {q_b:+.3f}, "
+             f"{'con historial' if (coincide or _nj(bk) in QB_RATING) else 'sin historial: nivel de reemplazo'})")
+
+    # 2) RESPALDO (solo si el depth chart no dio a nadie): salario NFL / uso reciente
+    elif estado == "fuera":
         # Candidatos = QB activos del roster (más los de contratos), SIN ninguno que aparezca en el reporte de lesiones.
         pool = {}
         for z in (salarios_qb or {}).get(team, []):
@@ -795,7 +951,7 @@ def escenario_qb(Q, team, inj, M, ref, salarios_qb=None):
         if disp:
             bk, sal = disp[0][1]
             coincide = next((z for z in candidatos if _nj(z["n"]) == _nj(bk)), None)
-            q_b = float(coincide["q"]) if coincide else float(q.get("mu_rep", q_b))
+            q_b = float(coincide["q"]) if coincide else float(QB_RATING.get(_nj(bk), q.get("mu_rep", q_b)))
             diag(f"QB {team}: reemplazo por salario NFL → {bk} (${sal:.2f}M/año)")
         else:
             # Respaldo: uso reciente, excluyendo a cualquiera que esté en el reporte de lesiones.
@@ -808,8 +964,6 @@ def escenario_qb(Q, team, inj, M, ref, salarios_qb=None):
                 q_b = float(q.get("mu_rep", q_b))
         # Recalcula la diferencia con el reemplazo elegido.
         dl = float(np.clip((q_s - q_b) * QB_DB_JUEGO * QB_ESCALA, 0.5, QB_MAX_PTS))
-    else:
-        dl = float(q["delta"])
 
     s = float(q["s"])
     juega = min(QB_BONO_MAX, (1 - s) * dl) if QB_CORREGIR_JUEGA else 0.0
@@ -850,10 +1004,12 @@ def alternativas_qb(h, a, sh, sa, mar0, tot0, spread_line, total_line):
 def filas_nfl(h, a, mar, tot, sp_line, tot_line, M, ref, R=None, bad=None, duda=None, adj=(0.0, 0.0)):
     """bad: {equipo: nombres que NO jugarán (se excluyen)}. duda: {equipo: {nombre: estatus}} dudables: la fila de quien
     SÍ juega va arriba (etiqueta DUDA) y la de su suplente (si no juega) va hasta abajo.
+    El jugador se toma del depth chart de ESPN (saltando lesionados); en Resultados (R) no se usa el depth chart actual.
     adj: ajuste de puntos por QB (local, visita) que también mueve las yardas aéreas del equipo."""
     R = R or {}
     bad = bad or {}
     duda = duda or {}
+    usar_depth = not R
     rows = [
         fila("Spread · local gana por >", mar, "n", SD_MARGEN, num(sp_line), f"{h} cubre", f"{a} cubre", real=R.get("spread")),
         fila("Total de puntos", tot, "n", 13, num(tot_line), real=R.get("total")),
@@ -874,7 +1030,7 @@ def filas_nfl(h, a, mar, tot, sp_line, tot_line, M, ref, R=None, bad=None, duda=
             for pos, etq, key in (("QB", "yds pase", "air"), ("RB", "yds suelo", "gr"), ("WR", "yds recep.", "air")):
                 dfn = M[key][1].get(opp, 1)
                 fuera = bad.get(team, frozenset())
-                j = jugador(M, team, pos, ref, dfn, fuera)
+                j = jugador(M, team, pos, ref, dfn, fuera, depth=usar_depth)
                 if not j:
                     continue
                 pid, nombre, mu, sd = j
@@ -889,9 +1045,9 @@ def filas_nfl(h, a, mar, tot, sp_line, tot_line, M, ref, R=None, bad=None, duda=
                     continue
                 # dudable: SI JUEGA va arriba con su valor normal (etiqueta DUDA)...
                 rows.append(fila(f"{pos} {nombre} ({team}) · {etq} · ⚠ DUDA", mu, "n", sd, real=real))
-                # ...y SI NO JUEGA va hasta abajo con su suplente
+                # ...y SI NO JUEGA va hasta abajo con el siguiente del depth chart
                 excl = fuera | frozenset(duda.get(team, {})) | {_nj(nombre)}
-                s2 = jugador(M, team, pos, ref, dfn, excl, activo=False)
+                s2 = jugador(M, team, pos, ref, dfn, excl, activo=False, depth=usar_depth)
                 if s2:
                     _, n2, mu2, sd2 = s2
                     dudosos.append(fila(f"Si no juega {nombre.split()[-1]} → {pos} {n2} ({team}) · {etq}", mu2, "n", sd2, real=None))
@@ -975,6 +1131,7 @@ def nfl():
         nfl_qb_roster(nfr, temp)
     if len(prox):
         nfl_qb_espn(temp)                                      # ESPN pisa roster y salarios de nflverse
+        nfl_depth()                                            # depth chart de ESPN (QB / RB / WR)
     if Q:
         top = sorted(Q.items(), key=lambda kv: -kv[1]["delta"])[:5]
         diag("QB · valor vs suplente (pts/juego), top 5: " + ", ".join(f"{t} {q['n']} {q['delta']:.1f}" for t, q in top))
@@ -985,6 +1142,8 @@ def nfl():
         h, a = r.home_team, r.away_team
         inj = inj_w.get(int(r.week), {})
         bad, duda = partir_lesiones(inj)
+        for t_ in (h, a):
+            diag(f"Depth {t_}: QB {DEPTH.get(t_, {}).get('QB', [])[:3]} · RB {DEPTH.get(t_, {}).get('RB', [])[:2]} · WR {DEPTH.get(t_, {}).get('WR', [])[:3]} · fuera {sorted(bad.get(t_, []))}")
 
         mar0, tot0 = pred_nfl(M_hoy, h, a)                     # modelo base (sin ajuste de QB)
         sh = escenario_qb(Q, h, inj, M_hoy, ref_hoy, SALARIOS_QB)
@@ -1806,7 +1965,7 @@ td{overflow-wrap:break-word}td:nth-child(2),td:nth-child(3){white-space:nowrap}t
 </header>
 <main><h1 id="ttl"></h1><div id="descr" class="sub"></div>
 <div id="home" class="lobby"></div>
-<div id="ai"></div><div id="picks"></div><div class="chips" id="chips"></div><div class="grid" id="grid"></div><div class="nota">Modelo estadístico (Ridge / Poisson / Normal). Edge = probabilidad del modelo × cuota decimal − 1 (el momio de la casa ya incluye su margen). Puedes escribir tu momio en americano (+150, -110) o decimal (2.50): se detecta solo; con el botón ± cambias el signo. 🏠 = equipo local. Racha = últimos 5 juegos (G ganó · E empató · P perdió). Estrellas 1-5 = ranking de todos los equipos de la liga con sus últimos 5 juegos: puntos/goles a favor (ofensiva) y en contra (defensiva), ajustados por la calidad del rival; 5 = el 20 % mejor. Bajas = reporte de lesiones de ESPN/nflverse (gana el reporte más reciente); los jugadores que no jugarán (Out, IR, PUP, suspendidos) se excluyen de las apuestas; los dudables (Questionable, Doubtful, Day-To-Day) aparecen marcados con DUDA: su fila normal va arriba y la del suplente (si no juega) hasta abajo. Ajuste de QB: el valor del mariscal titular sobre su suplente se mide con EPA por jugada; si está fuera, el reemplazo se elige por mayor salario base NFL de la temporada actual (datos de contratos OverTheCap vía nflverse) entre los QB activos del roster que no aparezcan en el reporte de lesiones; si no hay salario utilizable, se usa el uso reciente. El salario se expresa en millones de dólares por año. El modelo ya resta esos puntos, y si está dudoso la tabla asume que juega y abajo aparece el escenario "si no juega". Cifras redondeadas, salvo proyecciones, spread y total. Los picks de Gemini combinan tu modelo con noticias de la web y pueden fallar. Solo informativo, no es asesoría financiera. En Resultados se visualizan exclusivamente filas con datos reales.</div></main>"""
+<div id="ai"></div><div id="picks"></div><div class="chips" id="chips"></div><div class="grid" id="grid"></div><div class="nota">Modelo estadístico (Ridge / Poisson / Normal). Edge = probabilidad del modelo × cuota decimal − 1 (el momio de la casa ya incluye su margen). Puedes escribir tu momio en americano (+150, -110) o decimal (2.50): se detecta solo; con el botón ± cambias el signo. 🏠 = equipo local. Racha = últimos 5 juegos (G ganó · E empató · P perdió). Estrellas 1-5 = ranking de todos los equipos de la liga con sus últimos 5 juegos: puntos/goles a favor (ofensiva) y en contra (defensiva), ajustados por la calidad del rival; 5 = el 20 % mejor. Bajas = reporte de lesiones de ESPN/nflverse (gana el reporte más reciente); los jugadores que no jugarán (Out, IR, PUP, suspendidos) se excluyen de las apuestas y se reemplazan por el siguiente del depth chart de ESPN (QB, RB y WR); si ESPN no trae el depth chart se usa el volumen reciente. Los dudables (Questionable, Doubtful, Day-To-Day) aparecen marcados con DUDA: su fila normal va arriba y la del suplente del depth chart (si no juega) hasta abajo. Ajuste de QB: el valor del mariscal titular sobre su suplente se mide con EPA por jugada; si está fuera o dudoso, el reemplazo es el siguiente QB del depth chart de ESPN que no aparezca en el reporte de lesiones; si ESPN no lo trae, se elige por mayor salario base NFL de la temporada actual (contratos OverTheCap vía nflverse) y, si no hay salario utilizable, por uso reciente. El salario se expresa en millones de dólares por año. El modelo ya resta esos puntos, y si está dudoso la tabla asume que juega y abajo aparece el escenario "si no juega". Cifras redondeadas, salvo proyecciones, spread y total. Los picks de Gemini combinan tu modelo con noticias de la web y pueden fallar. Solo informativo, no es asesoría financiera. En Resultados se visualizan exclusivamente filas con datos reales.</div></main>"""
 
 HTML_PART2_JS = r"""<script>
 const D = __DATA__;
@@ -1962,7 +2121,7 @@ function card(g, hist) {
   const EQ = q => q.estado === 'fuera' ? 'FUERA' : (EST[String(q.est).toLowerCase()] || esc(q.est));
   const qbH = (!hist && g.qb && g.qb.length) ? `<div class="qbn">${g.qb.map(q => q.estado === 'fuera'
     ? `🚑 QB ${esc(q.n)} (${esc(q.eq)}) · ${EQ(q)} → el modelo ya le resta ${Math.abs(q.adj).toFixed(1)} pts a ${esc(q.eq)} (entra ${esc(q.bk)})`
-    : `⚠ QB ${esc(q.n)} (${esc(q.eq)}) · ${EQ(q)} → la tabla asume que juega; si no juega son ${q.fuera.toFixed(1)} pts (abajo)`).join('<br>')}</div>` : '';
+    : `⚠ QB ${esc(q.n)} (${esc(q.eq)}) · ${EQ(q)} → la tabla asume que juega; si no juega entra ${esc(q.bk)} y son ${q.fuera.toFixed(1)} pts (abajo)`).join('<br>')}</div>` : '';
   const altH = (!hist && g.alt && g.alt.length) ? g.alt.map(a => `<div class="alt"><h4>SI NO JUEGA ${esc(a.qb)} (${esc(a.eq)})</h4>
     <div class="pj p">Proyección ${f1(a.proy[0])} - ${f1(a.proy[1])} · ${esc(g.home)} gana ${Math.round(a.p_h * 100)}%</div>
     <div class="tw"><table><tr class="hd"><td></td><td>Modelo</td><td>Tu línea</td><td>Prob · justo</td></tr>${a.rows.map(r => rowH(r, false, mk)).join('')}</table></div>
